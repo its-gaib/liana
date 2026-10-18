@@ -78,6 +78,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Ubuntu 22.04's OpenSSL keeps Bitcoin's RIPEMD160 in its legacy provider.
+          # Scope provider activation to this disposable test step, keeping default TLS policy.
+          openssl_conf="$RUNNER_TEMP/liana-test-openssl.cnf"
+          cat > "$openssl_conf" <<'OPENSSL'
+          openssl_conf = openssl_init
+          [openssl_init]
+          providers = provider_sect
+          [provider_sect]
+          default = default_sect
+          legacy = legacy_sect
+          [default_sect]
+          activate = 1
+          [legacy_sect]
+          activate = 1
+          OPENSSL
+          export OPENSSL_CONF="$openssl_conf"
+          "$RUNNER_TEMP/liana-test-venv/bin/python" -c 'import hashlib; assert hashlib.new("ripemd160", b"").hexdigest() == "9c1185a5c5e9fc54612808977ee8f548b2258d31"'
           "$RUNNER_TEMP/liana-test-venv/bin/python" -m pytest -n 2 \
             --junitxml=fractional-fees-test-results.xml \
             tests/test_fractional_fees.py tests/test_spend.py tests/test_rpc.py
