@@ -42,8 +42,8 @@ jobs:
         run: rustup toolchain install 1.89.0 --profile minimal
       - name: Core and daemon unit tests
         run: cargo +1.89.0 test --locked --release -p liana -p lianad --lib
-      - name: GUI fractional fee regression tests
-        run: cargo +1.89.0 test --locked --release -p liana-gui --no-default-features --lib fractional_feerate_tests
+      - name: GUI unit tests
+        run: cargo +1.89.0 test --locked --release -p liana-gui --no-default-features --lib
 
   # Build concurrently; release publication separately requires this entire run to pass.
   artifacts:
