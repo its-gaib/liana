@@ -10,6 +10,7 @@ use std::{
     str::FromStr,
 };
 
+use liana::feerate::FeeRate;
 use miniscript::bitcoin::{self, psbt::Psbt, Txid};
 
 fn create_spend(control: &DaemonControl, params: Params) -> Result<serde_json::Value, Error> {
@@ -41,11 +42,17 @@ fn create_spend(control: &DaemonControl, params: Params) -> Result<serde_json::V
                 .collect::<Option<Vec<bitcoin::OutPoint>>>()
         })
         .ok_or_else(|| Error::invalid_params("Invalid 'outpoints' parameter."))?;
-    let feerate: u64 = params
-        .get(2, "feerate")
-        .ok_or_else(|| Error::invalid_params("Missing 'feerate' parameter."))?
-        .as_u64()
-        .ok_or_else(|| Error::invalid_params("Invalid 'feerate' parameter."))?;
+    let feerate: FeeRate = serde_json::from_value(
+        params
+            .get(2, "feerate")
+            .ok_or_else(|| Error::invalid_params("Missing 'feerate' parameter."))?
+            .clone(),
+    )
+    .map_err(|_| {
+        Error::invalid_params(
+            "Invalid 'feerate': expected 0.1 to 1000 sat/vB with at most three decimal places.",
+        )
+    })?;
     let change_address: Option<bitcoin::Address<bitcoin::address::NetworkUnchecked>> = params
         .get(3, "change_address")
         .map(|addr| {
@@ -110,12 +117,12 @@ fn rbf_psbt(control: &DaemonControl, params: Params) -> Result<serde_json::Value
         .ok_or_else(|| Error::invalid_params("Missing 'is_cancel' parameter."))?
         .as_bool()
         .ok_or_else(|| Error::invalid_params("Invalid 'is_cancel' parameter."))?;
-    let feerate_vb: Option<u64> = if let Some(feerate) = params.get(2, "feerate") {
-        Some(
-            feerate
-                .as_u64()
-                .ok_or_else(|| Error::invalid_params("Invalid 'feerate' parameter."))?,
-        )
+    let feerate_vb: Option<FeeRate> = if let Some(feerate) = params.get(2, "feerate") {
+        Some(serde_json::from_value(feerate.clone()).map_err(|_| {
+            Error::invalid_params(
+                "Invalid 'feerate': expected 0.1 to 1000 sat/vB with at most three decimal places.",
+            )
+        })?)
     } else {
         None
     };
@@ -373,11 +380,17 @@ fn create_recovery(control: &DaemonControl, params: Params) -> Result<serde_json
         .as_str()
         .and_then(|s| bitcoin::Address::from_str(s).ok())
         .ok_or_else(|| Error::invalid_params("Invalid 'address' parameter."))?;
-    let feerate: u64 = params
-        .get(1, "feerate")
-        .ok_or_else(|| Error::invalid_params("Missing 'feerate' parameter."))?
-        .as_u64()
-        .ok_or_else(|| Error::invalid_params("Invalid 'feerate' parameter."))?;
+    let feerate: FeeRate = serde_json::from_value(
+        params
+            .get(1, "feerate")
+            .ok_or_else(|| Error::invalid_params("Missing 'feerate' parameter."))?
+            .clone(),
+    )
+    .map_err(|_| {
+        Error::invalid_params(
+            "Invalid 'feerate': expected 0.1 to 1000 sat/vB with at most three decimal places.",
+        )
+    })?;
     let timelock: Option<u16> = params
         .get(2, "timelock")
         .map(|tl| {

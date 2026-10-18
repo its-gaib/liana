@@ -1,6 +1,6 @@
 #![allow(clippy::result_large_err)]
 
-use crate::descriptors;
+use crate::{descriptors, feerate::FeeRate};
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -11,14 +11,13 @@ use std::{
 
 pub use bdk_coin_select::InsufficientFunds;
 use bdk_coin_select::{
-    metrics::LowestFee, Candidate, ChangePolicy, CoinSelector, DrainWeights, FeeRate, Replace,
-    Target, TargetFee, TargetOutputs, TXIN_BASE_WEIGHT,
+    metrics::LowestFee, Candidate, ChangePolicy, CoinSelector, DrainWeights,
+    FeeRate as SelectionFeeRate, Replace, Target, TargetFee, TargetOutputs, TXIN_BASE_WEIGHT,
 };
 use miniscript::bitcoin::{
     self,
     absolute::{Height, LockTime},
     bip32,
-    constants::WITNESS_SCALE_FACTOR,
     psbt::{Input as PsbtIn, Output as PsbtOut, Psbt},
     secp256k1,
 };
@@ -38,7 +37,11 @@ pub const LONG_TERM_FEERATE_VB: f32 = 5.0;
 pub const MAX_FEE: bitcoin::Amount = bitcoin::Amount::ONE_BTC;
 
 /// Assume that paying more than 1000sat/vb in feerate is a bug.
-pub const MAX_FEERATE: u64 = 1_000;
+pub const MAX_FEERATE: FeeRate = FeeRate::from_sat_per_vb(1_000);
+/// Minimum supported transaction fee rate (0.1 sat/vB).
+pub const MIN_FEERATE_VB: FeeRate = FeeRate::from_sat_per_kvb(100);
+/// Conservatively retain the incremental fee required by older Bitcoin Core nodes.
+pub const BITCOIN_CORE_INCREMENTAL_RELAY_FEERATE_VB: FeeRate = FeeRate::from_sat_per_vb(1);
 
 /// Do not set locktime if tip age in seconds is older than this.
 // See also https://github.com/bitcoin/bitcoin/blob/ecd23656db174adef61d3bd753d02698c3528192/src/wallet/spend.cpp#L906.
@@ -49,13 +52,13 @@ pub enum InsaneFeeInfo {
     NegativeFee,
     InvalidFeerate,
     TooHighFee(u64),
-    TooHighFeerate(u64),
+    TooHighFeerate(FeeRate),
 }
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpendCreationError {
-    InvalidFeerate(/* sats/vb */ u64),
+    InvalidFeerate(FeeRate),
     InvalidOutputValue(bitcoin::Amount),
     InsaneFees(InsaneFeeInfo),
     SanityCheckFailure(Psbt),
@@ -149,14 +152,17 @@ fn sanity_check_psbt(
 
     // Check the feerate isn't insane.
     let tx_vb = spent_desc.unsigned_tx_max_vbytes(tx, use_primary_path);
-    let feerate_sats_vb = abs_fee
-        .checked_div(tx_vb)
-        .ok_or(SpendCreationError::InsaneFees(
-            InsaneFeeInfo::InvalidFeerate,
-        ))?;
-    if !(1..=MAX_FEERATE).contains(&feerate_sats_vb) {
+    if tx_vb == 0
+        || u128::from(abs_fee) * 1_000
+            < u128::from(MIN_FEERATE_VB.as_sat_per_kvb()) * u128::from(tx_vb)
+    {
         return Err(SpendCreationError::InsaneFees(
-            InsaneFeeInfo::TooHighFeerate(feerate_sats_vb),
+            InsaneFeeInfo::InvalidFeerate,
+        ));
+    }
+    if u128::from(abs_fee) * 1_000 > u128::from(MAX_FEERATE.as_sat_per_kvb()) * u128::from(tx_vb) {
+        return Err(SpendCreationError::InsaneFees(
+            InsaneFeeInfo::TooHighFeerate(FeeRate::from_fee_vbytes(abs_fee, tx_vb)),
         ));
     }
 
@@ -272,7 +278,7 @@ fn select_coins_for_spend(
     candidate_coins: &[CandidateCoin],
     base_tx: bitcoin::Transaction,
     change_txo: bitcoin::TxOut,
-    feerate_vb: f32,
+    feerate_vb: FeeRate,
     replaced_fee: Option<u64>,
     max_sat_weight: u64,
     must_have_change: bool,
@@ -290,43 +296,32 @@ fn select_coins_for_spend(
     };
     let n_outputs_nochange = base_tx.output.len();
     let max_input_weight = TXIN_BASE_WEIGHT + max_sat_weight;
-    // Get feerate as u64 for calculation relating to ancestor below.
-    // We expect `feerate_vb` to be a positive integer, but take ceil()
-    // just in case to be sure we pay enough for ancestors.
-    let feerate_vb_u64 = feerate_vb.ceil() as u64;
-    let witness_factor: u64 = WITNESS_SCALE_FACTOR
-        .try_into()
-        .expect("scale factor must fit in u64");
-    // This will be used to store any extra weight added to candidates.
-    let mut added_weights = HashMap::<bitcoin::OutPoint, u64>::with_capacity(candidate_coins.len());
+    // Store the exact additional whole-satoshi fee for each candidate, independently
+    // of the approximate weight used to express that fee to the coin selector.
+    let mut added_fees = HashMap::<bitcoin::OutPoint, u64>::with_capacity(candidate_coins.len());
     let candidates: Vec<Candidate> = candidate_coins
         .iter()
         .map(|cand| Candidate {
             input_count: 1,
             value: cand.amount.to_sat(),
             weight: {
-                let extra = cand
+                let extra_fee = cand
                     .ancestor_info
                     .map(|info| {
-                        // The implied ancestor vsize if the fee had been paid at our target feerate.
-                        let ancestor_vsize_at_feerate = <u32 as Into<u64>>::into(info.fee)
-                            .checked_div(feerate_vb_u64)
-                            .expect("feerate is greater than zero");
-                        // If the actual ancestor vsize is bigger than the implied vsize, we will need to
-                        // pay the difference in order for the combined feerate to be at the target value.
-                        // We multiply the vsize by 4 to get the ancestor weight, which is an upper bound
-                        // on its true weight (vsize*4 - 3 <= weight <= vsize*4), to ensure we pay enough.
-                        // Note that if candidates share ancestors, we may add this difference more than
-                        // once in the resulting transaction.
-                        info.vsize
-                            .saturating_sub(ancestor_vsize_at_feerate)
-                            .checked_mul(witness_factor)
-                            .expect("weight difference must fit in u64")
+                        feerate_vb
+                            .fee_vbytes(info.vsize)
+                            .expect("ancestor fee fits in u64")
+                            .saturating_sub(u64::from(info.fee))
                     })
                     .unwrap_or(0);
-                // Store the extra weight for this candidate for use later on.
-                // At the same time, make sure there are no duplicate outpoints.
-                assert!(added_weights.insert(cand.outpoint, extra).is_none());
+                // Express the fee deficit as weight, rounding up so selection reserves
+                // sufficient funds. Shared ancestors may still be counted more than once.
+                let numerator = u128::from(extra_fee) * 4_000;
+                let denominator = u128::from(feerate_vb.as_sat_per_kvb());
+                let extra: u64 = ((numerator + denominator - 1) / denominator)
+                    .try_into()
+                    .expect("effective ancestor weight fits in u64");
+                assert!(added_fees.insert(cand.outpoint, extra_fee).is_none());
                 max_input_weight
                     .checked_add(extra)
                     .expect("effective weight must fit in u64")
@@ -346,8 +341,8 @@ fn select_coins_for_spend(
     // Now set the change policy. We use a policy which ensures no change output is created with a
     // lower value than our custom dust limit. NOTE: the change output weight must not account for
     // a potential difference in the size of the outputs count varint.
-    let feerate = FeeRate::from_sat_per_vb(feerate_vb);
-    let long_term_feerate = FeeRate::from_sat_per_vb(LONG_TERM_FEERATE_VB);
+    let feerate = SelectionFeeRate::from_sat_per_vb(feerate_vb.as_sat_per_vb() as f32);
+    let long_term_feerate = SelectionFeeRate::from_sat_per_vb(LONG_TERM_FEERATE_VB);
     let change_output_weight = change_txo.weight().to_wu();
     let drain_weights = DrainWeights {
         output_weight: change_output_weight,
@@ -442,24 +437,22 @@ fn select_coins_for_spend(
             .try_into()
             .expect("value is non-negative"),
     );
-    let mut total_added_weight: u64 = 0;
+    let mut total_added_fee: u64 = 0;
     let selected = selector
         .selected_indices()
         .iter()
         .map(|i| candidate_coins[*i])
         .inspect(|cand| {
-            total_added_weight = total_added_weight
+            total_added_fee = total_added_fee
                 .checked_add(
-                    *added_weights
+                    *added_fees
                         .get(&cand.outpoint)
-                        .expect("contains added weight for all candidates"),
+                        .expect("contains added fees for all candidates"),
                 )
                 .expect("should fit in u64")
         })
         .collect();
-    // Calculate added fee based on the feerate in sats/wu, which is the feerate used for coin selection.
-    let fee_for_ancestors =
-        bitcoin::Amount::from_sat(((total_added_weight as f32) * feerate.spwu()).ceil() as u64);
+    let fee_for_ancestors = bitcoin::Amount::from_sat(total_added_fee);
     Ok(CoinSelectionRes {
         selected,
         change_amount,
@@ -540,10 +533,10 @@ pub trait TxGetter {
 /// information about how it should be set.
 pub enum SpendTxFees {
     /// The target feerate in sats/vb for this transaction.
-    Regular(u64),
+    Regular(FeeRate),
     /// The (target feerate in sats/vb, total fees in sats of transaction(s) to be replaced
     /// including descendants) for this transaction.
-    Rbf(u64, u64),
+    Rbf(FeeRate, u64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -640,8 +633,13 @@ pub fn create_spend(
         SpendTxFees::Rbf(feerate, fee) => (feerate, Some(fee)),
     };
     let is_self_send = destinations.is_empty();
-    if feerate_vb < 1 {
+    if feerate_vb < MIN_FEERATE_VB {
         return Err(SpendCreationError::InvalidFeerate(feerate_vb));
+    }
+    if feerate_vb > MAX_FEERATE {
+        return Err(SpendCreationError::InsaneFees(
+            InsaneFeeInfo::TooHighFeerate(feerate_vb),
+        ));
     }
 
     // Create transaction with no inputs and no outputs.
@@ -704,14 +702,6 @@ pub fn create_spend(
         // by the coins selection helper function.
         assert!(tx.input.is_empty());
         assert_eq!(tx.output.len(), destinations.len());
-        // TODO: Introduce general conversion error type.
-        let feerate_vb: f32 = {
-            let fr: u16 = feerate_vb.try_into().map_err(|_| {
-                SpendCreationError::InsaneFees(InsaneFeeInfo::TooHighFeerate(feerate_vb))
-            })?;
-            fr
-        }
-        .into();
         let max_sat_wu = main_descriptor
             .max_sat_weight(use_primary_path)
             .try_into()
@@ -790,6 +780,66 @@ pub fn create_spend(
         psbt_ins.push(psbt_in);
     }
 
+    // The selector uses floating point rates per weight unit. Enforce the exact selected
+    // sat/kvB rate on the rounded-up signed virtual size before returning a transaction.
+    // Only the change (or explicit sweep) output may fund a rounding shortfall.
+    let tx_vbytes = main_descriptor.unsigned_tx_max_vbytes(&tx, use_primary_path);
+    let required_fee = feerate_vb
+        .fee_vbytes(tx_vbytes)
+        .and_then(|fee| fee.checked_add(fee_for_ancestors.to_sat()))
+        .ok_or(SpendCreationError::InsaneFees(
+            InsaneFeeInfo::InvalidFeerate,
+        ))?;
+    let required_fee = if let Some(replaced_fee) = replaced_fee {
+        required_fee.max(
+            replaced_fee
+                .checked_add(
+                    BITCOIN_CORE_INCREMENTAL_RELAY_FEERATE_VB
+                        .fee_vbytes(tx_vbytes)
+                        .ok_or(SpendCreationError::InsaneFees(
+                            InsaneFeeInfo::InvalidFeerate,
+                        ))?,
+                )
+                .ok_or(SpendCreationError::InsaneFees(
+                    InsaneFeeInfo::InvalidFeerate,
+                ))?,
+        )
+    } else {
+        required_fee
+    };
+    let value_in: u64 = selected.iter().map(|coin| coin.amount.to_sat()).sum();
+    let value_out: u64 = tx.output.iter().map(|output| output.value.to_sat()).sum();
+    let actual_fee = value_in
+        .checked_sub(value_out)
+        .ok_or(SpendCreationError::InsaneFees(InsaneFeeInfo::NegativeFee))?;
+    if has_change {
+        let change = tx.output.last_mut().expect("change output exists");
+        let minimum = DUST_OUTPUT_SATS.max(change.script_pubkey.minimal_non_dust().to_sat());
+        let available = change.value.to_sat().saturating_sub(minimum);
+        let shortfall = required_fee.saturating_sub(actual_fee);
+        if shortfall > available {
+            return Err(SpendCreationError::CoinSelection(InsufficientFunds {
+                missing: shortfall - available,
+            }));
+        }
+        // Refund selector rounding excess to change as well. A floating point
+        // approximation must never increase what the user pays in fees.
+        let corrected = change
+            .value
+            .to_sat()
+            .checked_add(actual_fee.saturating_sub(required_fee))
+            .and_then(|value| value.checked_sub(shortfall))
+            .ok_or(SpendCreationError::InsaneFees(
+                InsaneFeeInfo::InvalidFeerate,
+            ))?;
+        check_output_value(bitcoin::Amount::from_sat(corrected))?;
+        change.value = bitcoin::Amount::from_sat(corrected);
+    } else if required_fee > actual_fee {
+        return Err(SpendCreationError::CoinSelection(InsufficientFunds {
+            missing: required_fee - actual_fee,
+        }));
+    }
+
     // Finally, create the PSBT with all inputs and outputs, sanity check it and return it.
     let psbt = Psbt {
         unsigned_tx: tx,
@@ -817,6 +867,255 @@ mod tests {
     use std::time::Duration;
 
     use miniscript::bitcoin::absolute::{Height, LockTime};
+
+    struct EmptyTxGetter;
+    impl TxGetter for EmptyTxGetter {
+        fn get_tx(&mut self, _: &bitcoin::Txid) -> Option<bitcoin::Transaction> {
+            None
+        }
+    }
+
+    fn fee_fixture(
+        taproot: bool,
+    ) -> (
+        descriptors::LianaDescriptor,
+        CandidateCoin,
+        SpendOutputAddress,
+    ) {
+        use std::str::FromStr;
+        let primary = "[abcdef01]xpub6Eze7yAT3Y1wGrnzedCNVYDXUqa9NmHVWck5emBaTbXtURbe1NWZbK9bsz1TiVE7Cz341PMTfYgFw1KdLWdzcM1UMFTcdQfCYhhXZ2HJvTW/<0;1>/*";
+        let recovery = "[abcdef02]xpub688Hn4wScQAAiYJLPg9yH27hUpfZAUnmJejRQBCiwfP5PEDzjWMNW1wChcninxr5gyavFqbbDjdV1aK5USJz8NDVjUy7FRQaaqqXHh5SbXe/<0;1>/*";
+        let desc = if taproot {
+            format!("tr({primary},and_v(v:pk({recovery}),older(52560)))")
+        } else {
+            format!("wsh(or_d(pk({primary}),and_v(v:pkh({recovery}),older(52560))))")
+        };
+        let desc = descriptors::LianaDescriptor::from_str(&desc).unwrap();
+        let index = bip32::ChildNumber::from_normal_idx(0).unwrap();
+        let addr = desc
+            .change_descriptor()
+            .derive(index, &secp256k1::Secp256k1::verification_only())
+            .address(bitcoin::Network::Regtest);
+        let coin = CandidateCoin {
+            outpoint: bitcoin::OutPoint::new(bitcoin::Txid::from_str(&"11".repeat(32)).unwrap(), 0),
+            amount: bitcoin::Amount::from_sat(1_000_000),
+            deriv_index: index,
+            is_change: false,
+            must_select: true,
+            sequence: None,
+            ancestor_info: None,
+        };
+        (
+            desc,
+            coin,
+            SpendOutputAddress {
+                addr,
+                info: Some(AddrInfo {
+                    index,
+                    is_change: true,
+                }),
+            },
+        )
+    }
+
+    fn actual_fee(psbt: &Psbt) -> u64 {
+        let input: u64 = psbt
+            .inputs
+            .iter()
+            .map(|input| input.witness_utxo.as_ref().unwrap().value.to_sat())
+            .sum();
+        let output: u64 = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .map(|output| output.value.to_sat())
+            .sum();
+        input.checked_sub(output).unwrap()
+    }
+
+    #[test]
+    fn fractional_fees_preserve_recipients_change_and_sweeps() {
+        let secp = secp256k1::Secp256k1::verification_only();
+        for taproot in [false, true] {
+            for recovery in [false, true] {
+                let (desc, mut coin, change) = fee_fixture(taproot);
+                if recovery {
+                    coin.sequence = Some(bitcoin::Sequence::from_height(52560));
+                }
+                for sat_kvb in [100, 125, 333, 999, 1_000, 1_234, 1_000_000] {
+                    let rate = FeeRate::from_sat_per_kvb(sat_kvb);
+                    for sweep in [false, true] {
+                        let recipient = bitcoin::Amount::from_sat(100_000);
+                        let destination = [(change.clone(), recipient)];
+                        let result = create_spend(
+                            &desc,
+                            &secp,
+                            &mut EmptyTxGetter,
+                            if sweep { &[] } else { &destination },
+                            &[coin],
+                            SpendTxFees::Regular(rate),
+                            change.clone(),
+                            LockTime::ZERO,
+                        )
+                        .unwrap();
+                        assert!(result.has_change);
+                        let tx = &result.psbt.unsigned_tx;
+                        let expected_fee = rate
+                            .fee_vbytes(desc.unsigned_tx_max_vbytes(tx, !recovery))
+                            .unwrap();
+                        assert_eq!(
+                            actual_fee(&result.psbt),
+                            expected_fee,
+                            "rate={rate}, taproot={taproot}, recovery={recovery}, sweep={sweep}"
+                        );
+                        assert!(result.warnings.is_empty());
+                        assert_eq!(tx.output.len(), if sweep { 1 } else { 2 });
+                        if !sweep {
+                            assert_eq!(tx.output[0].value, recipient);
+                            assert_eq!(tx.output[0].script_pubkey, change.addr.script_pubkey());
+                        }
+                        assert_eq!(
+                            tx.output.last().unwrap().value.to_sat(),
+                            coin.amount.to_sat()
+                                - expected_fee
+                                - if sweep { 0 } else { recipient.to_sat() }
+                        );
+                        assert_eq!(
+                            tx.output.last().unwrap().script_pubkey,
+                            change.addr.script_pubkey()
+                        );
+                        assert_eq!(tx.input[0].previous_output, coin.outpoint);
+                        assert_eq!(
+                            tx.input[0].sequence,
+                            coin.sequence
+                                .unwrap_or(bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME)
+                        );
+                        sanity_check_psbt(&desc, &result.psbt, !recovery).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fractional_ancestors_only_charge_actual_shortfall() {
+        let secp = secp256k1::Secp256k1::verification_only();
+        let (desc, mut coin, change) = fee_fixture(true);
+        let rate = FeeRate::from_sat_per_kvb(125);
+        let create = |coin| {
+            create_spend(
+                &desc,
+                &secp,
+                &mut EmptyTxGetter,
+                &[],
+                &[coin],
+                SpendTxFees::Regular(rate),
+                change.clone(),
+                LockTime::ZERO,
+            )
+            .unwrap()
+        };
+        let baseline = create(coin);
+        // A 1,000-vbyte ancestor has already paid precisely 0.125 sat/vB. Rounding
+        // the requested rate up to 1 would have erroneously charged for it again.
+        coin.ancestor_info = Some(AncestorInfo {
+            vsize: 1_000,
+            fee: 125,
+        });
+        let paid = create(coin);
+        assert_eq!(paid.psbt, baseline.psbt);
+        assert!(paid.warnings.is_empty());
+        coin.ancestor_info = Some(AncestorInfo {
+            vsize: 1_000,
+            fee: 0,
+        });
+        let unpaid = create(coin);
+        assert_eq!(actual_fee(&unpaid.psbt), actual_fee(&baseline.psbt) + 125);
+        assert_eq!(
+            unpaid.warnings,
+            vec![CreateSpendWarning::AdditionalFeeForAncestors(125)]
+        );
+    }
+
+    #[test]
+    fn fractional_replacements_preserve_incremental_fee_and_outputs() {
+        let secp = secp256k1::Secp256k1::verification_only();
+        let (desc, coin, change) = fee_fixture(true);
+        let recipient = bitcoin::Amount::from_sat(100_000);
+        let result = create_spend(
+            &desc,
+            &secp,
+            &mut EmptyTxGetter,
+            &[(change.clone(), recipient)],
+            &[coin],
+            SpendTxFees::Rbf(FeeRate::from_sat_per_kvb(250), 1_000),
+            change,
+            LockTime::ZERO,
+        )
+        .unwrap();
+        let vbytes = desc.unsigned_tx_max_vbytes(&result.psbt.unsigned_tx, true);
+        assert_eq!(actual_fee(&result.psbt), 1_000 + vbytes);
+        assert_eq!(result.psbt.unsigned_tx.output[0].value, recipient);
+    }
+
+    #[test]
+    fn fractional_rates_retain_fee_and_dust_bounds() {
+        let secp = secp256k1::Secp256k1::verification_only();
+        let (desc, coin, change) = fee_fixture(true);
+        for rate in [0, 99, 1_000_001, u64::MAX] {
+            assert!(create_spend(
+                &desc,
+                &secp,
+                &mut EmptyTxGetter,
+                &[],
+                &[coin],
+                SpendTxFees::Regular(FeeRate::from_sat_per_kvb(rate)),
+                change.clone(),
+                LockTime::ZERO
+            )
+            .is_err());
+        }
+        let dust = bitcoin::Amount::from_sat(DUST_OUTPUT_SATS - 1);
+        assert_eq!(
+            create_spend(
+                &desc,
+                &secp,
+                &mut EmptyTxGetter,
+                &[(change.clone(), dust)],
+                &[coin],
+                SpendTxFees::Regular(MIN_FEERATE_VB),
+                change.clone(),
+                LockTime::ZERO
+            )
+            .err(),
+            Some(SpendCreationError::InvalidOutputValue(dust))
+        );
+        let mut expensive = create_spend(
+            &desc,
+            &secp,
+            &mut EmptyTxGetter,
+            &[],
+            &[coin],
+            SpendTxFees::Regular(MIN_FEERATE_VB),
+            change,
+            LockTime::ZERO,
+        )
+        .unwrap()
+        .psbt;
+        expensive.unsigned_tx.output[0].value = bitcoin::Amount::from_sat(DUST_OUTPUT_SATS);
+        assert!(matches!(
+            sanity_check_psbt(&desc, &expensive, true),
+            Err(SpendCreationError::InsaneFees(
+                InsaneFeeInfo::TooHighFeerate(_)
+            ))
+        ));
+        expensive.inputs[0].witness_utxo.as_mut().unwrap().value =
+            bitcoin::Amount::from_sat(MAX_FEE.to_sat() + 1_000);
+        assert!(matches!(
+            sanity_check_psbt(&desc, &expensive, true),
+            Err(SpendCreationError::InsaneFees(InsaneFeeInfo::TooHighFee(_)))
+        ));
+    }
 
     #[test]
     fn test_anti_fee_sniping_locktime() {

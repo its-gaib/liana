@@ -68,12 +68,7 @@ pub fn setup_panic_hook() {
 }
 
 // Simple compile-time constant
-pub const VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION_MAJOR"),
-    ".",
-    env!("CARGO_PKG_VERSION_MINOR"),
-    ""
-);
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug)]
 pub enum StartupError {

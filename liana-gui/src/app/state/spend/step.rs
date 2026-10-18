@@ -10,6 +10,7 @@ use std::{
 };
 
 use iced::{Subscription, Task};
+use liana::feerate::FeeRate;
 use liana::{
     miniscript::bitcoin::{
         address,
@@ -142,6 +143,17 @@ fn filter_coins(
 pub enum FeeMode {
     Manual,
     Smart(FeeLevel),
+}
+
+/// Keep the exact text while editing so an invalid decimal cannot leave a
+/// previously valid fee rate selected behind the visible input.
+fn edit_feerate(input: &mut form::Value<String>, value: String) {
+    input.valid = value.is_empty()
+        || value
+            .parse::<FeeRate>()
+            .map(|rate| rate <= MAX_FEERATE)
+            .unwrap_or(false);
+    input.value = value;
 }
 
 pub struct DefineSpend {
@@ -428,7 +440,11 @@ impl DefineSpend {
                 .clone()
         };
 
-        let feerate_vb = self.feerate.value.parse::<u64>().expect("Checked before");
+        let feerate_vb = self
+            .feerate
+            .value
+            .parse::<FeeRate>()
+            .expect("Checked before");
         let recovery_timelock = self.recovery_timelock;
         match tokio::runtime::Handle::current().block_on(async {
             // If recovery timelock is set, create a recovery transaction. Otherwise, a regular spend.
@@ -676,15 +692,7 @@ impl Step for DefineSpend {
                             .update(cache.network, msg);
                     }
                     view::CreateSpendMessage::FeerateEdited(s) => {
-                        if let Ok(value) = s.parse::<u64>() {
-                            self.feerate.value = s;
-                            self.feerate.valid = value != 0 && value <= MAX_FEERATE;
-                        } else if s.is_empty() {
-                            self.feerate.value = "".to_string();
-                            self.feerate.valid = true;
-                        } else {
-                            self.feerate.valid = false;
-                        }
+                        edit_feerate(&mut self.feerate, s);
                         self.warning = None;
                     }
                     view::CreateSpendMessage::FeeModeManual => {
@@ -715,7 +723,9 @@ impl Step for DefineSpend {
                             .collect();
                         let mut outputs: HashMap<Address<address::NetworkUnchecked>, u64> =
                             HashMap::new();
-                        let feerate_vb = self.feerate.value.parse::<u64>().unwrap_or(0);
+                        let Ok(feerate_vb) = self.feerate.value.parse::<FeeRate>() else {
+                            return Task::none();
+                        };
                         self.warning = None;
                         if let Some(reco_tl) = self.recovery_timelock {
                             let recovery_address = Address::from_str(
@@ -802,7 +812,7 @@ impl Step for DefineSpend {
                         FeeLevel::High => est.high,
                     };
                     self.feerate.value = value.to_string();
-                    self.feerate.valid = value != 0 && value <= MAX_FEERATE;
+                    self.feerate.valid = FeeRate::from_sat_per_vb(value) <= MAX_FEERATE;
                 }
 
                 // Attempt to select coins automatically if:
@@ -1385,4 +1395,27 @@ fn recovery_paths(wallet: &Wallet, coins: &[Coin], tip_height: i32) -> Vec<Recov
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod fractional_feerate_tests {
+    use super::*;
+
+    #[test]
+    fn manual_fee_input_accepts_fractional_rates_and_preserves_invalid_edits() {
+        let mut input = form::Value::default();
+        for value in ["0.1", "0.125", "0.999", "1", "1000"] {
+            edit_feerate(&mut input, value.to_string());
+            assert!(input.valid, "{}", value);
+            assert_eq!(input.value, value);
+        }
+        for value in ["0", "0.099", "1000.001", "0.1234", "-1", "NaN", "0."] {
+            edit_feerate(&mut input, value.to_string());
+            assert!(!input.valid, "{}", value);
+            assert_eq!(input.value, value);
+        }
+        edit_feerate(&mut input, String::new());
+        assert!(input.valid);
+        assert!(input.value.is_empty());
+    }
 }

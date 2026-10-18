@@ -207,7 +207,7 @@ pub fn create_spend_tx<'a>(
         fee_amount,
         to_fiat,
         cache.pane_size.get().width,
-        liana::spend::MAX_FEERATE,
+        liana::spend::MAX_FEERATE.as_sat_per_kvb() / 1_000,
     );
 
     let coin_rows = coins

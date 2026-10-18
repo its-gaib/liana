@@ -22,12 +22,7 @@ pub mod utils;
 pub mod view;
 pub mod window;
 
-pub const VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION_MAJOR"),
-    ".",
-    env!("CARGO_PKG_VERSION_MINOR"),
-    ""
-);
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
 mod tests {

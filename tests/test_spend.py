@@ -13,9 +13,7 @@ from test_framework.utils import (
 
 def additional_fees(anc_vsize, anc_fee, target_feerate):
     """The additional fee which must have been computed by lianad."""
-    computed_anc_vsize = int(anc_fee / target_feerate)
-    extra_vsize = anc_vsize - computed_anc_vsize
-    return extra_vsize * target_feerate
+    return max(0, math.ceil(anc_vsize * target_feerate) - anc_fee)
 
 
 def test_spend_change(lianad, bitcoind):
@@ -259,9 +257,9 @@ def test_send_to_self(lianad, bitcoind):
     # ... but it did use a new change address:
     assert info["change_index"] == 1
 
-    # Note they may ask for an impossible send-to-self. In this case we'll report missing amount.
-    huge_feerate = 50_000 if USE_TAPROOT else 40_500
-    assert "missing" in lianad.rpc.createspend({}, outpoints, huge_feerate)
+    # Reject excessive fee rates before attempting coin selection.
+    with pytest.raises(RpcError, match="feerate"):
+        lianad.rpc.createspend({}, outpoints, 1001)
 
     # Sign and broadcast the send-to-self transaction created above.
     signed_psbt = lianad.signer.sign_psbt(spend_psbt)

@@ -1,0 +1,105 @@
+name: Fractional fee fork artifacts
+
+on:
+  push:
+    branches: [feature/sub-sat-fees-v15]
+    tags: ['v15.0-sub-sat.*']
+  workflow_dispatch:
+
+# This workflow uploads build artifacts only. Publishing a release is separate.
+permissions:
+  contents: read
+
+concurrency:
+  group: fractional-fees-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: '2'
+  CARGO_PROFILE_RELEASE_DEBUG: '0'
+  FORK_VERSION: 15.0.0-sub-sat.1
+
+jobs:
+  tests:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check release tag matches fork version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            test "$GITHUB_REF_NAME" = "v15.0-sub-sat.${FORK_VERSION##*.}"
+          fi
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev pkg-config libvulkan-dev libfontconfig1-dev
+      - name: Install explicit Rust toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - name: Core and daemon unit tests
+        run: cargo +1.89.0 test --locked --release -p liana -p lianad --lib
+      - name: GUI fractional fee regression tests
+        run: cargo +1.89.0 test --locked --release -p liana-gui --no-default-features --lib fractional_feerate_tests
+
+  # Build concurrently; release publication separately requires this entire run to pass.
+  artifacts:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            platform: x86_64-unknown-linux-gnu
+            rustflags: ''
+          - runner: macos-14
+            platform: aarch64-apple-darwin
+            rustflags: ''
+          - runner: macos-15-intel
+            platform: x86_64-apple-darwin
+            rustflags: ''
+          - runner: windows-2022
+            platform: x86_64-pc-windows-msvc
+            rustflags: '-C target-feature=+crt-static'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
+      # Avoid requiring users to install the Visual C++ runtime separately.
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Linux build and packaging dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev pkg-config libvulkan-dev libfontconfig1-dev dpkg-dev
+      - name: Install explicit Rust toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal --target '${{ matrix.platform }}'
+      - name: Build native GUI without development debugger
+        run: cargo +1.89.0 build --locked --release --target '${{ matrix.platform }}' -p liana-gui --no-default-features --bin liana-gui
+      - name: Build native daemon and CLI
+        if: runner.os != 'Windows'
+        run: cargo +1.89.0 build --locked --release --target '${{ matrix.platform }}' -p lianad --bins
+      - name: Package fork artifacts and checksums
+        env:
+          ARTIFACT_PLATFORM: ${{ matrix.platform }}
+        run: >-
+          python contrib/release/build-fractional-artifacts.py
+          --platform "$ARTIFACT_PLATFORM"
+          --version "$FORK_VERSION"
+          --commit "$GITHUB_SHA"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: liana-sub-sat-${{ matrix.platform }}
+          path: fractional-release-assets/*
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0

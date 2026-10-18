@@ -1,3 +1,4 @@
+use liana::feerate::FeeRate;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -222,12 +223,9 @@ impl SpendTx {
     }
 
     /// Feerate obtained if all transaction inputs have the maximum satisfaction size.
-    pub fn min_feerate_vb(&self) -> Option<u64> {
-        self.fee_amount.map(|a| {
-            a.to_sat()
-                .checked_div(self.max_vbytes)
-                .expect("a descriptor's satisfaction size is never 0")
-        })
+    pub fn min_feerate_vb(&self) -> Option<FeeRate> {
+        self.fee_amount
+            .map(|a| FeeRate::from_fee_vbytes(a.to_sat(), self.max_vbytes))
     }
 
     pub fn is_send_to_self(&self) -> bool {

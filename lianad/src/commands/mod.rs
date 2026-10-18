@@ -17,6 +17,7 @@ pub use crate::database::{CoinStatus, LabelItem};
 
 use liana::{
     descriptors,
+    feerate::FeeRate,
     spend::{
         self, create_spend, AddrInfo, AncestorInfo, CandidateCoin, CreateSpendRes,
         SpendCreationError, SpendOutputAddress, SpendTxFees, TxGetter,
@@ -50,7 +51,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandError {
     NoOutpointForSelfSend,
-    InvalidFeerate(/* sats/vb */ u64),
+    InvalidFeerate(/* sats/vb */ FeeRate),
     UnknownOutpoint(bitcoin::OutPoint),
     AlreadySpent(bitcoin::OutPoint),
     ImmatureCoinbase(bitcoin::OutPoint),
@@ -59,7 +60,7 @@ pub enum CommandError {
     InsufficientFunds(
         /* in value */ bitcoin::Amount,
         /* out value */ Option<bitcoin::Amount>,
-        /* target feerate */ u64,
+        /* target feerate */ FeeRate,
     ),
     UnknownSpend(bitcoin::Txid),
     // FIXME: when upgrading Miniscript put the actual error there
@@ -145,7 +146,7 @@ impl From<SpendCreationError> for CommandError {
 pub enum RbfErrorInfo {
     MissingFeerate,
     SuperfluousFeerate,
-    TooLowFeerate(u64, u64),
+    TooLowFeerate(FeeRate, FeeRate),
     NotSignaling,
 }
 
@@ -619,7 +620,7 @@ impl DaemonControl {
         &self,
         destinations: &HashMap<bitcoin::Address<bitcoin::address::NetworkUnchecked>, u64>,
         coins_outpoints: &[bitcoin::OutPoint],
-        feerate_vb: u64,
+        feerate_vb: FeeRate,
         change_address: Option<bitcoin::Address<bitcoin::address::NetworkUnchecked>>,
     ) -> Result<CreateSpendResult, CommandError> {
         let is_self_send = destinations.is_empty();
@@ -627,7 +628,7 @@ impl DaemonControl {
         if is_self_send && coins_outpoints.is_empty() {
             return Err(CommandError::NoOutpointForSelfSend);
         }
-        if feerate_vb < 1 {
+        if !feerate_vb.is_valid() {
             return Err(CommandError::InvalidFeerate(feerate_vb));
         }
         let mut db_conn = self.db.connection();
@@ -947,14 +948,19 @@ impl DaemonControl {
     ///   in order to pay the higher fee (this applies also when replacing a self-send).
     ///
     /// `feerate_vb` is the target feerate for the RBF transaction (in sat/vb). If `None`, it will be set
-    /// to 1 sat/vb larger than the feerate of the previous transaction, which is the minimum value allowed
-    /// when using RBF.
+    /// conservatively 1 sat/vb above the previous transaction's feerate. This supports
+    /// nodes that retain the older incremental relay policy.
     pub fn rbf_psbt(
         &self,
         txid: &bitcoin::Txid,
         is_cancel: bool,
-        feerate_vb: Option<u64>,
+        feerate_vb: Option<FeeRate>,
     ) -> Result<CreateSpendResult, CommandError> {
+        if let Some(rate) = feerate_vb {
+            if !rate.is_valid() {
+                return Err(CommandError::InvalidFeerate(rate));
+            }
+        }
         let mut db_conn = self.db.connection();
         let mut tx_getter = DbTxGetter::new(&self.db);
 
@@ -1001,22 +1007,19 @@ impl DaemonControl {
         // rules #3, #4 and #6 (see
         // https://github.com/bitcoin/bitcoin/blob/master/doc/policy/mempool-replacements.md). By
         // default (ie if the transaction we are replacing was dropped from the mempool) there is
-        // no minimum absolute fee and the minimum feerate is 1, the minimum relay feerate.
+        // no minimum absolute fee and the minimum target is our supported minimum.
+        // Keep a conservative 1 sat/vb increment for compatibility with older nodes.
         let (min_feerate_vb, descendant_fees) = self
             .bitcoin
             .mempool_spenders(&prev_outpoints)
             .into_iter()
             .fold(
-                (1, bitcoin::Amount::from_sat(0)),
+                (spend::MIN_FEERATE_VB, bitcoin::Amount::from_sat(0)),
                 |(min_feerate, descendant_fee), entry| {
-                    let entry_feerate = entry
-                        .fees
-                        .base
-                        .checked_div(entry.vsize)
-                        .expect("Can't have a null vsize or tx would be invalid")
-                        .to_sat()
-                        .checked_add(1)
-                        .expect("Can't overflow or tx would be invalid");
+                    let entry_feerate =
+                        FeeRate::from_fee_vbytes(entry.fees.base.to_sat(), entry.vsize)
+                            .checked_add(spend::BITCOIN_CORE_INCREMENTAL_RELAY_FEERATE_VB)
+                            .expect("valid transaction fee rate cannot overflow");
                     (
                         std::cmp::max(min_feerate, entry_feerate),
                         descendant_fee + entry.fees.descendant,
@@ -1255,10 +1258,10 @@ impl DaemonControl {
         &self,
         address: bitcoin::Address<address::NetworkUnchecked>,
         coins_outpoints: &[bitcoin::OutPoint],
-        feerate_vb: u64,
+        feerate_vb: FeeRate,
         timelock: Option<u16>,
     ) -> Result<CreateRecoveryResult, CommandError> {
-        if feerate_vb < 1 {
+        if !feerate_vb.is_valid() {
             return Err(CommandError::InvalidFeerate(feerate_vb));
         }
         let mut tx_getter = DbTxGetter::new(&self.db);
@@ -2021,7 +2024,7 @@ mod tests {
         let dummy_value = 10_000;
         let mut destinations = <HashMap<bitcoin::Address<address::NetworkUnchecked>, u64>>::new();
         assert_eq!(
-            control.create_spend(&destinations, &[], 1, None),
+            control.create_spend(&destinations, &[], FeeRate::from_sat_per_vb(1), None),
             Err(CommandError::NoOutpointForSelfSend)
         );
         destinations = [(dummy_addr.clone(), dummy_value)]
@@ -2030,18 +2033,28 @@ mod tests {
             .collect();
         // Insufficient funds for coin selection.
         assert!(matches!(
-            control.create_spend(&destinations, &[], 1, None),
+            control.create_spend(&destinations, &[], FeeRate::from_sat_per_vb(1), None),
             Ok(CreateSpendResult::InsufficientFunds { .. }),
         ));
         assert_eq!(
-            control.create_spend(&destinations, &[dummy_op], 0, None),
-            Err(CommandError::InvalidFeerate(0))
+            control.create_spend(
+                &destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(0),
+                None
+            ),
+            Err(CommandError::InvalidFeerate(FeeRate::from_sat_per_vb(0)))
         );
 
         // The coin doesn't exist. If we create a new unspent one at this outpoint with a much
         // higher value, we'll get a Spend transaction with a change output.
         assert_eq!(
-            control.create_spend(&destinations, &[dummy_op], 1, None),
+            control.create_spend(
+                &destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None
+            ),
             Err(CommandError::UnknownOutpoint(dummy_op))
         );
         db_conn.new_unspent_coins(&[Coin {
@@ -2058,11 +2071,16 @@ mod tests {
         // If we try to use coin selection, the unconfirmed not-from-self coin will not be used
         // as a candidate and so we get a coin selection error due to insufficient funds.
         assert!(matches!(
-            control.create_spend(&destinations, &[], 1, None),
+            control.create_spend(&destinations, &[], FeeRate::from_sat_per_vb(1), None),
             Ok(CreateSpendResult::InsufficientFunds { .. }),
         ));
         let (psbt, warnings) = if let CreateSpendResult::Success { psbt, warnings } = control
-            .create_spend(&destinations, &[dummy_op], 1, None)
+            .create_spend(
+                &destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None,
+            )
             .unwrap()
         {
             (psbt, warnings)
@@ -2092,7 +2110,12 @@ mod tests {
         // At 2sats/vb, it's twice that.
         assert_eq!(tx.output[1].value.to_sat(), 89_839);
         let psbt = if let CreateSpendResult::Success { psbt, .. } = control
-            .create_spend(&destinations, &[dummy_op], 2, None)
+            .create_spend(
+                &destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(2),
+                None,
+            )
             .unwrap()
         {
             psbt
@@ -2105,22 +2128,42 @@ mod tests {
         // A feerate of 555 won't trigger the sanity checks (they were previously not taking the
         // satisfaction size into account and overestimating the feerate).
         control
-            .create_spend(&destinations, &[dummy_op], 555, None)
+            .create_spend(
+                &destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(555),
+                None,
+            )
             .unwrap();
 
         // If we ask for a too high feerate, or a too large/too small output, it'll fail.
         assert!(matches!(
-            control.create_spend(&destinations, &[dummy_op], 10_000, None),
-            Ok(CreateSpendResult::InsufficientFunds { .. }),
+            control.create_spend(
+                &destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(10_000),
+                None
+            ),
+            Err(CommandError::InvalidFeerate(_)),
         ));
         *destinations.get_mut(&dummy_addr).unwrap() = 100_001;
         assert!(matches!(
-            control.create_spend(&destinations, &[dummy_op], 1, None),
+            control.create_spend(
+                &destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None
+            ),
             Ok(CreateSpendResult::InsufficientFunds { .. }),
         ));
         *destinations.get_mut(&dummy_addr).unwrap() = DUST - 1;
         assert_eq!(
-            control.create_spend(&destinations, &[dummy_op], 1, None),
+            control.create_spend(
+                &destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None
+            ),
             Err(CommandError::SpendCreation(
                 SpendCreationError::InvalidOutputValue(bitcoin::Amount::from_sat(DUST - 1))
             ))
@@ -2132,7 +2175,12 @@ mod tests {
         let invalid_destinations: HashMap<bitcoin::Address<address::NetworkUnchecked>, u64> =
             [(invalid_addr, dummy_value)].iter().cloned().collect();
         assert!(matches!(
-            control.create_spend(&invalid_destinations, &[dummy_op], 1, None),
+            control.create_spend(
+                &invalid_destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None
+            ),
             Err(CommandError::Address(
                 address::error::ParseError::NetworkValidation { .. }
             ))
@@ -2142,7 +2190,12 @@ mod tests {
         // won't create an output lower than 500 sats.
         *destinations.get_mut(&dummy_addr).unwrap() = COIN_VALUE - DUST;
         let (psbt, warnings) = if let CreateSpendResult::Success { psbt, warnings } = control
-            .create_spend(&destinations, &[dummy_op], 1, None)
+            .create_spend(
+                &destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None,
+            )
             .unwrap()
         {
             (psbt, warnings)
@@ -2171,7 +2224,12 @@ mod tests {
         // Increase the target value by the change amount and the warning will disappear.
         *destinations.get_mut(&dummy_addr).unwrap() = (COIN_VALUE - DUST) + 339;
         let (psbt, warnings) = if let CreateSpendResult::Success { psbt, warnings } = control
-            .create_spend(&destinations, &[dummy_op], 1, None)
+            .create_spend(
+                &destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None,
+            )
             .unwrap()
         {
             (psbt, warnings)
@@ -2186,7 +2244,12 @@ mod tests {
         *destinations.get_mut(&dummy_addr).unwrap() =
             (COIN_VALUE - DUST) + 330 + /* fee for change output */ 43;
         let (psbt, warnings) = if let CreateSpendResult::Success { psbt, warnings } = control
-            .create_spend(&destinations, &[dummy_op], 1, None)
+            .create_spend(
+                &destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None,
+            )
             .unwrap()
         {
             (psbt, warnings)
@@ -2201,7 +2264,12 @@ mod tests {
         *destinations.get_mut(&dummy_addr).unwrap() =
             (COIN_VALUE - DUST) + 339 + /* fee for change output */ 43 + 1;
         assert_eq!(
-            control.create_spend(&destinations, &[dummy_op], 1, None),
+            control.create_spend(
+                &destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None
+            ),
             Ok(CreateSpendResult::InsufficientFunds { missing: 1 }),
         );
 
@@ -2209,7 +2277,12 @@ mod tests {
         *destinations.get_mut(&dummy_addr).unwrap() =
             COIN_VALUE - /* fee without change */ 118 - /* extra fee for change output */ 43 - 1;
         let warnings = if let CreateSpendResult::Success { warnings, .. } = control
-            .create_spend(&destinations, &[dummy_op], 1, None)
+            .create_spend(
+                &destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None,
+            )
             .unwrap()
         {
             warnings
@@ -2230,7 +2303,12 @@ mod tests {
         *destinations.get_mut(&dummy_addr).unwrap() = (COIN_VALUE - DUST) - /* fee without change */ 118 - /* extra fee for change output */ 43;
 
         let (psbt, warnings) = if let CreateSpendResult::Success { psbt, warnings } = control
-            .create_spend(&destinations, &[dummy_op], 1, None)
+            .create_spend(
+                &destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None,
+            )
             .unwrap()
         {
             (psbt, warnings)
@@ -2246,7 +2324,12 @@ mod tests {
         *destinations.get_mut(&dummy_addr).unwrap() = (COIN_VALUE - DUST) - /* fee without change */ 118 - /* extra fee for change output */ 43
             + 1;
         let warnings = if let CreateSpendResult::Success { warnings, .. } = control
-            .create_spend(&destinations, &[dummy_op], 1, None)
+            .create_spend(
+                &destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None,
+            )
             .unwrap()
         {
             warnings
@@ -2272,13 +2355,18 @@ mod tests {
             .unwrap(),
         )]);
         assert_eq!(
-            control.create_spend(&destinations, &[dummy_op], 1, None),
+            control.create_spend(
+                &destinations,
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None
+            ),
             Err(CommandError::AlreadySpent(dummy_op))
         );
         // If we try to use coin selection, the spent coin will not be used as a candidate
         // and so we get a coin selection error due to insufficient funds.
         assert!(matches!(
-            control.create_spend(&destinations, &[], 1, None),
+            control.create_spend(&destinations, &[], FeeRate::from_sat_per_vb(1), None),
             Ok(CreateSpendResult::InsufficientFunds { .. }),
         ));
 
@@ -2299,9 +2387,14 @@ mod tests {
             is_from_self: false,
         }]);
         assert_eq!(
-            control.create_spend(&destinations, &[dummy_op_dup], 1_001, None),
-            Err(CommandError::SpendCreation(SpendCreationError::InsaneFees(
-                InsaneFeeInfo::TooHighFeerate(1_001)
+            control.create_spend(
+                &destinations,
+                &[dummy_op_dup],
+                FeeRate::from_sat_per_vb(1_001),
+                None
+            ),
+            Err(CommandError::InvalidFeerate(FeeRate::from_sat_per_vb(
+                1_001
             )))
         );
 
@@ -2324,14 +2417,14 @@ mod tests {
         db_conn.new_unspent_coins(&[unconfirmed_coin]);
         // Coin selection error due to insufficient funds.
         assert!(matches!(
-            control.create_spend(&destinations, &[], 1, None),
+            control.create_spend(&destinations, &[], FeeRate::from_sat_per_vb(1), None),
             Ok(CreateSpendResult::InsufficientFunds { .. }),
         ));
         // Set destination amount equal to value of confirmed coins.
         *destinations.get_mut(&dummy_addr).unwrap() = 80_000;
         // Coin selection error occurs due to insufficient funds to pay fee.
         assert!(matches!(
-            control.create_spend(&destinations, &[], 1, None),
+            control.create_spend(&destinations, &[], FeeRate::from_sat_per_vb(1), None),
             Ok(CreateSpendResult::InsufficientFunds { .. }),
         ));
         let confirmed_op_2 = bitcoin::OutPoint {
@@ -2354,8 +2447,9 @@ mod tests {
             is_from_self: false,
         }]);
         // First, create a transaction using auto coin selection.
-        let psbt = if let CreateSpendResult::Success { psbt, .. } =
-            control.create_spend(&destinations, &[], 1, None).unwrap()
+        let psbt = if let CreateSpendResult::Success { psbt, .. } = control
+            .create_spend(&destinations, &[], FeeRate::from_sat_per_vb(1), None)
+            .unwrap()
         {
             psbt
         } else {
@@ -2380,7 +2474,12 @@ mod tests {
 
         // Create a second transaction using manual coin selection.
         let psbt = if let CreateSpendResult::Success { psbt, .. } = control
-            .create_spend(&destinations, &[confirmed_op_1, confirmed_op_2], 1, None)
+            .create_spend(
+                &destinations,
+                &[confirmed_op_1, confirmed_op_2],
+                FeeRate::from_sat_per_vb(1),
+                None,
+            )
             .unwrap()
         {
             psbt
@@ -2413,7 +2512,7 @@ mod tests {
         unconfirmed_coin_2.is_change = false;
         db_conn.new_unspent_coins(&[unconfirmed_coin_2]);
         assert!(matches!(
-            control.create_spend(&destinations, &[], 1, None),
+            control.create_spend(&destinations, &[], FeeRate::from_sat_per_vb(1), None),
             Ok(CreateSpendResult::InsufficientFunds { .. }),
         ));
         // 2. not from self and change
@@ -2422,7 +2521,7 @@ mod tests {
         unconfirmed_coin_2.is_change = true;
         db_conn.new_unspent_coins(&[unconfirmed_coin_2]);
         assert!(matches!(
-            control.create_spend(&destinations, &[], 1, None),
+            control.create_spend(&destinations, &[], FeeRate::from_sat_per_vb(1), None),
             Ok(CreateSpendResult::InsufficientFunds { .. }),
         ));
 
@@ -2441,7 +2540,7 @@ mod tests {
             .create_spend(
                 &destinations,
                 &[confirmed_op_1, confirmed_op_2],
-                1,
+                FeeRate::from_sat_per_vb(1),
                 Some(change_address.as_unchecked().clone()),
             )
             .unwrap()
@@ -2482,12 +2581,22 @@ mod tests {
         }]);
         let empty_dest = &HashMap::<bitcoin::Address<address::NetworkUnchecked>, u64>::new();
         assert_eq!(
-            control.create_spend(empty_dest, &[confirmed_op_3], 5, None),
+            control.create_spend(
+                empty_dest,
+                &[confirmed_op_3],
+                FeeRate::from_sat_per_vb(5),
+                None
+            ),
             Ok(CreateSpendResult::InsufficientFunds { missing: 150 },)
         );
         // If we use a lower fee, the self-send will succeed.
         let psbt = if let CreateSpendResult::Success { psbt, .. } = control
-            .create_spend(empty_dest, &[confirmed_op_3], 1, None)
+            .create_spend(
+                empty_dest,
+                &[confirmed_op_3],
+                FeeRate::from_sat_per_vb(1),
+                None,
+            )
             .unwrap()
         {
             psbt
@@ -2521,7 +2630,7 @@ mod tests {
             is_from_self: false,
         }]);
         assert_eq!(
-            control.create_spend(&destinations, &[imma_op], 1_001, None),
+            control.create_spend(&destinations, &[imma_op], FeeRate::from_sat_per_vb(1), None),
             Err(CommandError::ImmatureCoinbase(imma_op))
         );
 
@@ -2602,7 +2711,12 @@ mod tests {
                 .cloned()
                 .collect();
         let mut psbt_a = if let CreateSpendResult::Success { psbt, .. } = control
-            .create_spend(&destinations_a, &[dummy_op_a], 1, None)
+            .create_spend(
+                &destinations_a,
+                &[dummy_op_a],
+                FeeRate::from_sat_per_vb(1),
+                None,
+            )
             .unwrap()
         {
             psbt
@@ -2611,7 +2725,12 @@ mod tests {
         };
         let txid_a = psbt_a.unsigned_tx.compute_txid();
         let psbt_b = if let CreateSpendResult::Success { psbt, .. } = control
-            .create_spend(&destinations_b, &[dummy_op_b], 10, None)
+            .create_spend(
+                &destinations_b,
+                &[dummy_op_b],
+                FeeRate::from_sat_per_vb(10),
+                None,
+            )
             .unwrap()
         {
             psbt
@@ -2620,7 +2739,12 @@ mod tests {
         };
         let txid_b = psbt_b.unsigned_tx.compute_txid();
         let psbt_c = if let CreateSpendResult::Success { psbt, .. } = control
-            .create_spend(&destinations_c, &[dummy_op_a, dummy_op_b], 100, None)
+            .create_spend(
+                &destinations_c,
+                &[dummy_op_a, dummy_op_b],
+                FeeRate::from_sat_per_vb(100),
+                None,
+            )
             .unwrap()
         {
             psbt
@@ -3146,14 +3270,14 @@ mod tests {
             bitcoin::Address::from_str("bc1qnsexk3gnuyayu92fc3tczvc7k62u22a22ua2kv").unwrap();
         // Feerate cannot be less than 1.
         assert_eq!(
-            control.create_recovery(dummy_addr.clone(), &[], 0, None),
-            Err(CommandError::InvalidFeerate(0))
+            control.create_recovery(dummy_addr.clone(), &[], FeeRate::from_sat_per_vb(0), None),
+            Err(CommandError::InvalidFeerate(FeeRate::from_sat_per_vb(0)))
         );
         // If we ask to sweep to an address from another network, it will fail.
         let invalid_addr =
             bitcoin::Address::from_str("tb1qfufcrdyarcg5eph608c6l8vktrc9re6agu4se2").unwrap();
         assert!(matches!(
-            control.create_recovery(invalid_addr, &[], 1, None),
+            control.create_recovery(invalid_addr, &[], FeeRate::from_sat_per_vb(1), None),
             Err(CommandError::Address(
                 address::error::ParseError::NetworkValidation { .. }
             ))
@@ -3161,12 +3285,17 @@ mod tests {
 
         // We have no coins to create recovery.
         assert!(matches!(
-            control.create_recovery(dummy_addr.clone(), &[], 1, None),
+            control.create_recovery(dummy_addr.clone(), &[], FeeRate::from_sat_per_vb(1), None),
             Err(CommandError::RecoveryNotAvailable),
         ));
         // Coin is unknown.
         assert_eq!(
-            control.create_recovery(dummy_addr.clone(), &[dummy_op], 1, None),
+            control.create_recovery(
+                dummy_addr.clone(),
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None
+            ),
             Err(CommandError::UnknownOutpoint(dummy_op)),
         );
 
@@ -3185,39 +3314,60 @@ mod tests {
         db_conn.new_unspent_coins(&[dummy_coin]);
         // Recovery not available for unconfirmed coins.
         assert!(matches!(
-            control.create_recovery(dummy_addr.clone(), &[], 1, None),
+            control.create_recovery(dummy_addr.clone(), &[], FeeRate::from_sat_per_vb(1), None),
             Err(CommandError::RecoveryNotAvailable),
         ));
         assert_eq!(
-            control.create_recovery(dummy_addr.clone(), &[dummy_op], 1, None),
+            control.create_recovery(
+                dummy_addr.clone(),
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None
+            ),
             Err(CommandError::OutpointNotRecoverable(dummy_op, 10)),
         );
 
         // Confirm coin such that timelock (10) has not expired at next block (101).
         db_conn.confirm_coins(&[(dummy_op, 92, 100_000)]);
         assert!(matches!(
-            control.create_recovery(dummy_addr.clone(), &[], 1, None),
+            control.create_recovery(dummy_addr.clone(), &[], FeeRate::from_sat_per_vb(1), None),
             Err(CommandError::RecoveryNotAvailable),
         ));
         assert_eq!(
-            control.create_recovery(dummy_addr.clone(), &[dummy_op], 1, None),
+            control.create_recovery(
+                dummy_addr.clone(),
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None
+            ),
             Err(CommandError::OutpointNotRecoverable(dummy_op, 10)),
         );
 
         // If we use a smaller timelock value it works, even though we don't have any such
         // recovery timelock (see https://github.com/wizardsardine/liana/issues/1089).
         assert!(control
-            .create_recovery(dummy_addr.clone(), &[], 1, Some(9))
+            .create_recovery(
+                dummy_addr.clone(),
+                &[],
+                FeeRate::from_sat_per_vb(1),
+                Some(9)
+            )
             .is_ok());
         assert!(control
-            .create_recovery(dummy_addr.clone(), &[dummy_op], 1, Some(9))
+            .create_recovery(
+                dummy_addr.clone(),
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                Some(9)
+            )
             .is_ok());
 
         // Remove coin, re-add and confirm such that recovery available at next block.
         db_conn.remove_coins(&[dummy_op]);
         db_conn.new_unspent_coins(&[dummy_coin]);
         db_conn.confirm_coins(&[(dummy_op, 91, 100_000)]);
-        let res = control.create_recovery(dummy_addr.clone(), &[], 1, None);
+        let res =
+            control.create_recovery(dummy_addr.clone(), &[], FeeRate::from_sat_per_vb(1), None);
         assert!(res.is_ok());
         let psbt = res.unwrap().psbt;
         assert_eq!(psbt.outputs.len(), 1);
@@ -3234,11 +3384,21 @@ mod tests {
 
         // If we pass a larger timelock, it no longer works:
         assert!(matches!(
-            control.create_recovery(dummy_addr.clone(), &[], 1, Some(11)),
+            control.create_recovery(
+                dummy_addr.clone(),
+                &[],
+                FeeRate::from_sat_per_vb(1),
+                Some(11)
+            ),
             Err(CommandError::RecoveryNotAvailable),
         ));
         assert_eq!(
-            control.create_recovery(dummy_addr.clone(), &[dummy_op], 1, Some(11)),
+            control.create_recovery(
+                dummy_addr.clone(),
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                Some(11)
+            ),
             Err(CommandError::OutpointNotRecoverable(dummy_op, 11)),
         );
 
@@ -3249,11 +3409,16 @@ mod tests {
                 .unwrap(),
         )]);
         assert!(matches!(
-            control.create_recovery(dummy_addr.clone(), &[], 1, None),
+            control.create_recovery(dummy_addr.clone(), &[], FeeRate::from_sat_per_vb(1), None),
             Err(CommandError::RecoveryNotAvailable),
         ));
         assert_eq!(
-            control.create_recovery(dummy_addr.clone(), &[dummy_op], 1, None),
+            control.create_recovery(
+                dummy_addr.clone(),
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None
+            ),
             Err(CommandError::AlreadySpent(dummy_op)),
         );
 
@@ -3265,13 +3430,18 @@ mod tests {
         db_conn.new_unspent_coins(&[dummy_coin]);
         db_conn.confirm_coins(&[(dummy_op, 91, 100_000)]);
         assert_eq!(
-            control.create_recovery(dummy_addr.clone(), &[], 1, None),
+            control.create_recovery(dummy_addr.clone(), &[], FeeRate::from_sat_per_vb(1), None),
             Err(CommandError::SpendCreation(
                 SpendCreationError::CoinSelection(InsufficientFunds { missing: 1 })
             )),
         );
         assert_eq!(
-            control.create_recovery(dummy_addr.clone(), &[dummy_op], 1, None),
+            control.create_recovery(
+                dummy_addr.clone(),
+                &[dummy_op],
+                FeeRate::from_sat_per_vb(1),
+                None
+            ),
             Err(CommandError::SpendCreation(
                 SpendCreationError::CoinSelection(InsufficientFunds { missing: 1 })
             )),
@@ -3294,22 +3464,37 @@ mod tests {
         db_conn.confirm_coins(&[(dummy_op_2, 92, 200_000)]);
         // Coin cannot be used as the timelock will still be in place at the next block.
         assert_eq!(
-            control.create_recovery(dummy_addr.clone(), &[], 1, None),
+            control.create_recovery(dummy_addr.clone(), &[], FeeRate::from_sat_per_vb(1), None),
             Err(CommandError::SpendCreation(
                 SpendCreationError::CoinSelection(InsufficientFunds { missing: 1 })
             )),
         );
         // If we try to specify the new coin, we'll get an error that the coin is not recoverable.
         assert_eq!(
-            control.create_recovery(dummy_addr.clone(), &[dummy_op, dummy_op_2], 1, None),
+            control.create_recovery(
+                dummy_addr.clone(),
+                &[dummy_op, dummy_op_2],
+                FeeRate::from_sat_per_vb(1),
+                None
+            ),
             Err(CommandError::OutpointNotRecoverable(dummy_op_2, 10)),
         );
         // Using a shorter timelock parameter works:
         assert!(control
-            .create_recovery(dummy_addr.clone(), &[], 1, Some(9))
+            .create_recovery(
+                dummy_addr.clone(),
+                &[],
+                FeeRate::from_sat_per_vb(1),
+                Some(9)
+            )
             .is_ok());
         assert!(control
-            .create_recovery(dummy_addr.clone(), &[dummy_op, dummy_op_2], 1, Some(9))
+            .create_recovery(
+                dummy_addr.clone(),
+                &[dummy_op, dummy_op_2],
+                FeeRate::from_sat_per_vb(1),
+                Some(9)
+            )
             .is_ok());
 
         // Now re-add the coin with a confirmation one block earlier.
@@ -3318,7 +3503,8 @@ mod tests {
         db_conn.confirm_coins(&[(dummy_op_2, 91, 200_000)]);
 
         // Now both coins are used in the recovery and we have enough funds.
-        let res = control.create_recovery(dummy_addr.clone(), &[], 1, None);
+        let res =
+            control.create_recovery(dummy_addr.clone(), &[], FeeRate::from_sat_per_vb(1), None);
         assert!(res.is_ok());
         let psbt = res.unwrap().psbt;
         assert_eq!(psbt.outputs.len(), 1);
@@ -3334,7 +3520,12 @@ mod tests {
         );
 
         // Do the same again, now specifying the outpoints explicitly.
-        let res = control.create_recovery(dummy_addr.clone(), &[dummy_op, dummy_op_2], 1, None);
+        let res = control.create_recovery(
+            dummy_addr.clone(),
+            &[dummy_op, dummy_op_2],
+            FeeRate::from_sat_per_vb(1),
+            None,
+        );
         assert!(res.is_ok());
         let psbt = res.unwrap().psbt;
         assert_eq!(psbt.outputs.len(), 1);
@@ -3349,7 +3540,8 @@ mod tests {
         );
 
         // Now check that increasing the feerate increases the fee.
-        let res = control.create_recovery(dummy_addr.clone(), &[], 2, None);
+        let res =
+            control.create_recovery(dummy_addr.clone(), &[], FeeRate::from_sat_per_vb(2), None);
         assert!(res.is_ok());
         let psbt = res.unwrap().psbt;
         assert_eq!(

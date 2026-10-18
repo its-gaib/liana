@@ -257,7 +257,7 @@ pub fn fee_rate_row<'a, M: Clone + 'static, F: Fn(Amount) -> FiatAmount>(
     let label = new::b3("Feerate:");
 
     let input: Element<'a, M> = Container::new(
-        form::Form::new_trimmed("e.g. 5 (in sats/vb)", feerate, on_edit)
+        form::Form::new_trimmed("e.g. 0.5 (in sats/vb)", feerate, on_edit)
             .compact()
             .fee(),
     )
@@ -343,7 +343,7 @@ pub fn fee_rate_row<'a, M: Clone + 'static, F: Fn(Amount) -> FiatAmount>(
         rows.push(row![
             Space::with_width(warn_offset),
             caption(format!(
-                "Feerate must be an integer less than or equal to {max_feerate} sats/vbyte"
+                "Feerate must be between 0.1 and {max_feerate} sats/vbyte, with up to 3 decimal places"
             ))
             .color(color::RED)
         ])

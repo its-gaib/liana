@@ -1,3 +1,4 @@
+use liana::feerate::FeeRate;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::iter::FromIterator;
@@ -137,7 +138,7 @@ impl<C: Client + Send + Sync + Debug> Daemon for Lianad<C> {
         &self,
         coins_outpoints: &[OutPoint],
         destinations: &HashMap<Address<address::NetworkUnchecked>, u64>,
-        feerate_vb: u64,
+        feerate_vb: FeeRate,
         change_address: Option<Address<address::NetworkUnchecked>>,
     ) -> Result<CreateSpendResult, DaemonError> {
         let mut input = vec![
@@ -155,7 +156,7 @@ impl<C: Client + Send + Sync + Debug> Daemon for Lianad<C> {
         &self,
         txid: &Txid,
         is_cancel: bool,
-        feerate_vb: Option<u64>,
+        feerate_vb: Option<FeeRate>,
     ) -> Result<CreateSpendResult, DaemonError> {
         let mut input = vec![json!(txid.to_string()), json!(is_cancel)];
         if let Some(feerate_vb) = feerate_vb {
@@ -207,7 +208,7 @@ impl<C: Client + Send + Sync + Debug> Daemon for Lianad<C> {
         &self,
         address: Address<address::NetworkUnchecked>,
         coins_outpoints: &[OutPoint],
-        feerate_vb: u64,
+        feerate_vb: FeeRate,
         sequence: Option<u16>,
     ) -> Result<Psbt, DaemonError> {
         let mut params = serde_json::Map::new();

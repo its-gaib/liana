@@ -1,6 +1,6 @@
 [package]
 name = "liana-gui"
-version = "15.0.0"
+version = "15.0.0-sub-sat.1"
 readme = "README.md"
 description = "Liana GUI"
 repository = "https://github.com/wizardsardine/liana"

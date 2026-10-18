@@ -141,6 +141,25 @@ learn your balance (and transaction history), but **would not be able to steal y
 Therefore you may afford a greater number of backups of your descriptor(s) and using less secure
 mediums than for storing your private key(s).
 
+#### Transaction fees
+
+Transaction creation, refreshing, recovery, and fee bumping accept fractional fee rates in sat/vB,
+from `0.1` to `1000` with up to three decimal places (for example, `0.333`). The transaction's
+absolute fee is rounded up to whole satoshis. Review the recipient amounts, change, and absolute
+fee on your signing device before approving a transaction.
+
+For a local Bitcoin Core node, the selected rate must meet both the node's relay floor and its
+current mempool minimum. Check `bitcoin-cli getmempoolinfo`: `minrelaytxfee` and `mempoolminfee`
+are in BTC/kvB, where `0.00000100` BTC/kvB equals `0.1` sat/vB. Older Core versions may require
+explicit policy configuration to accept rates below 1 sat/vB. Liana does not change your node's
+policy. Local acceptance does not guarantee that other nodes or miners will accept the transaction.
+
+Low fees can cause long confirmation delays or mempool eviction. Eviction does not cancel a signed
+transaction: it may be rebroadcast while its inputs remain unspent. Keep the required signing devices
+or cosigners available if you might need to bump the fee. Replacements use a conservative 1 sat/vB
+incremental relay allowance, so the smallest accepted bump can be substantially above the original
+fractional rate. Dust limits still apply independently of the selected fee rate.
+
 #### On refreshing coins
 
 You can use Liana just like a regular wallet. Simply be aware that if you are using a relative
@@ -151,6 +170,10 @@ at least once every `N` blocks. (With `N` the configured value of the timelock.)
 The GUI provide simple shortcuts to refresh one or more coin(s) if the recovery path is close to
 become available. This is achieved by making a transaction to yourself (if you don't need to make a
 payment.)
+
+**A refresh resets the recovery timelock only when it confirms.** While it is unconfirmed, the
+original coins continue aging and can become spendable with the recovery keys. Allow ample time
+for confirmation and use an appropriate fee when a recovery deadline is approaching.
 
 #### Signing devices and "hot" keys
 

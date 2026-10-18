@@ -35,6 +35,12 @@ Liana can be used for **trustless inheritance**, **loss protection** or **safer 
 
 ## Usage
 
+This branch adds fractional transaction fee rates (minimum **0.1 sat/vB**) to Liana v15.0,
+including sends, refreshes, recovery transactions, and fee bumping. Rates support up to three
+decimal places. Your connected Bitcoin Core node must accept the selected rate; low fees can delay
+confirmation. A refresh resets the recovery timelock only after confirmation. See
+[transaction fees](doc/USAGE.md#transaction-fees) for node policy and safety details.
+
 Liana is available on Windows, Mac and Linux. To install and start using it see
 [`doc/USAGE.md`](doc/USAGE.md). A more accessible version of Liana is also available as a web
 application [here](https://lianalite.com/).

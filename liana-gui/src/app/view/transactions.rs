@@ -259,7 +259,7 @@ pub fn create_rbf_modal<'a>(
                                 })
                                 .warning(
                                     "Feerate must be greater than previous value and \
-                                    less than or equal to 1000 sats/vbyte",
+                                    less than or equal to 1000 sats/vbyte (up to 3 decimal places)",
                                 )
                             } else {
                                 form::Form::new_disabled("", feerate)
@@ -353,7 +353,10 @@ pub fn tx_view<'a>(
                                 .push(
                                     text(format!(
                                         "({} sats/vbyte)",
-                                        fee_amount.to_sat() / tx.tx.vsize() as u64
+                                        liana::feerate::FeeRate::from_fee_vbytes(
+                                            fee_amount.to_sat(),
+                                            tx.tx.vsize() as u64,
+                                        )
                                     ))
                                     .size(H4_SIZE)
                                     .style(theme::text::secondary),

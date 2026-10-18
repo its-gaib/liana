@@ -239,6 +239,16 @@ the address of the wallet to sweep the funds to. Note however this output would 
 there is enough remaining funds after sending to the specified destinations. This command WILL NOT
 ERROR if there isn't enough leftover funds to create the change/sweep output.
 
+Fee rates are JSON numbers expressed in sat/vB: for example, `0.1`, `0.333`, or `1`.
+The fee is rounded up to a whole number of satoshis. Existing integer fee-rate inputs remain valid
+within the supported range. When spending an unconfirmed input, the transaction may also pay the
+fee deficit of its ancestors, as reported in `warnings`.
+
+A low requested fee rate does not guarantee acceptance by the connected backend, propagation to
+miners, or timely confirmation. For a local Bitcoin Core node, check `getmempoolinfo` for
+`minrelaytxfee` and `mempoolminfee` (both reported in BTC/kvB). See the
+[low-fee usage guidance](USAGE.md#transaction-fees), especially before refreshing coins.
+
 This command will refuse to create any output worth less than 5k sats.
 
 #### Request
@@ -247,7 +257,7 @@ This command will refuse to create any output worth less than 5k sats.
 | ---------------- | ----------------- | ----------------------------------------------------------------- |
 | `destinations`   | object            | Map from Bitcoin address to value.                                |
 | `outpoints`      | list of string    | List of the coins to be spent, as `txid:vout`.                    |
-| `feerate`        | integer           | Target feerate for the transaction, in satoshis per virtual byte. |
+| `feerate`        | number            | Target feerate in satoshis per virtual byte, from 0.1 to 1000 with at most three decimal places. |
 | `change_address` | string            | Address to be used for leftover amount, if any.                   |
 
 #### Response
@@ -365,7 +375,12 @@ If the transaction pays to more than one of our change addresses, then the one r
 will be used as a change address in the replacement and the others will be treated as non-change outputs
 (i.e. removed for cancel or otherwise kept the same).
 
-If `feerate` is not passed to the command, the target feerate of the replacement will be set to the minimum value
+Fee rates accept the same numeric format as [`createspend`](#createspend). Replacements retain a
+conservative incremental relay allowance of 1 sat/vB for compatibility with older Bitcoin Core
+versions, so a small fractional increase may be insufficient. An explicit rate that is too low is
+rejected. Fee bumping requires signing and broadcasting the replacement transaction.
+
+For a cancellation, omit `feerate`: the target fee rate is set to the minimum value
 allowed in order to replace this transaction using RBF (see https://github.com/bitcoin/bitcoin/blob/master/doc/policy/mempool-replacements.md#current-replace-by-fee-policy for further details about this and other conditions that must be satisfied when using RBF).
 
 #### Request
@@ -374,7 +389,7 @@ allowed in order to replace this transaction using RBF (see https://github.com/b
 | ----------- | ----------------- | --------------------------------------------------------------- |
 | `txid`      | string            | Hex encoded txid of the Spend transaction to be replaced.       |
 | `is_cancel` | bool              | Whether to "cancel" the transaction or simply bump the fee.     |
-| `feerate`   | integer(optional) | Target feerate for the RBF transaction (in sat/vb).             |
+| `feerate`   | number(optional)  | Required for a fee bump; must be omitted for a cancellation. Target in sat/vB, from 0.1 to 1000 with at most three decimal places. |
 
 #### Response
 
@@ -442,7 +457,8 @@ Confirmation time is based on the timestamp of blocks.
 ### `createrecovery`
 
 Create a transaction that sweeps coins using a timelocked recovery path to a provided address
-with the provided feerate.
+with the provided feerate. Fractional fee rates use the same format and rounding rules as
+[`createspend`](#createspend).
 
 If `outpoints` is empty or missing, then all coins for which the given recovery path is currently
 available will be used. Otherwise, only those specified will be considered. An error will
@@ -464,7 +480,7 @@ cover the requested feerate.
 | Field      | Type                   | Description                                                                               |
 | ---------- | ---------------------- | ----------------------------------------------------------------------------------------- |
 | `address`  | str                    | The Bitcoin address to sweep the coins to.                                                |
-| `feerate`  | integer                | Target feerate for the transaction, in satoshis per virtual byte.                         |
+| `feerate`  | number                 | Target feerate in sat/vB, from 0.1 to 1000 with at most three decimal places. |
 | `timelock` | int (optional)         | Recovery path to be used, identified by the number of blocks after which it is available. |
 | `outpoints`| list of str (optional) | List of the coins to be recovered, as `txid:vout`.                                        |
 

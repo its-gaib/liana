@@ -1,3 +1,4 @@
+use liana::feerate::FeeRate;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -36,6 +37,18 @@ use super::{
     auth::{self, AccessTokenResponse, AuthError},
     cache::update_connect_cache,
 };
+
+/// Connect's published API still expects integer sat/vbyte. Never truncate a
+/// fractional local fee rate when crossing this backend boundary.
+fn connect_feerate(rate: FeeRate) -> Result<u64, DaemonError> {
+    let rate = rate.as_sat_per_kvb();
+    if rate % 1_000 != 0 {
+        return Err(DaemonError::Unexpected(
+            "Fractional fee rates require a local Bitcoin Core backend; Liana Connect only supports whole sat/vbyte rates".to_string(),
+        ));
+    }
+    Ok(rate / 1_000)
+}
 
 impl From<Error> for DaemonError {
     fn from(value: Error) -> Self {
@@ -776,9 +789,10 @@ impl Daemon for BackendWalletClient {
         &self,
         coins_outpoints: &[OutPoint],
         destinations: &HashMap<Address<address::NetworkUnchecked>, u64>,
-        feerate_vb: u64,
+        feerate_vb: FeeRate,
         change_address: Option<Address<address::NetworkUnchecked>>,
     ) -> Result<CreateSpendResult, DaemonError> {
+        let feerate_vb = connect_feerate(feerate_vb)?;
         let mut recipients: Vec<api::payload::Recipient> = destinations
             .iter()
             .map(|(addr, amt)| api::payload::Recipient {
@@ -837,8 +851,9 @@ impl Daemon for BackendWalletClient {
         &self,
         txid: &Txid,
         is_cancel: bool,
-        feerate_vb: Option<u64>,
+        feerate_vb: Option<FeeRate>,
     ) -> Result<CreateSpendResult, DaemonError> {
+        let feerate_vb = feerate_vb.map(connect_feerate).transpose()?;
         let res: Result<api::DraftPsbt, DaemonError> = self
             .inner
             .request(
@@ -934,9 +949,10 @@ impl Daemon for BackendWalletClient {
         &self,
         address: Address<address::NetworkUnchecked>,
         coins_outpoints: &[OutPoint],
-        feerate_vb: u64,
+        feerate_vb: FeeRate,
         sequence: Option<u16>,
     ) -> Result<Psbt, DaemonError> {
+        let feerate_vb = connect_feerate(feerate_vb)?;
         let timelock = sequence.ok_or(DaemonError::Unexpected("Missing sequence".to_string()))?;
         let res: api::DraftPsbt = self
             .inner
@@ -1268,4 +1284,22 @@ fn spend_tx_from_api(
     );
     tx.load_labels(&labels);
     tx
+}
+
+#[cfg(test)]
+mod fractional_feerate_tests {
+    use super::*;
+
+    #[test]
+    fn connect_never_truncates_fractional_feerates() {
+        for rate in [100, 500, 999, 1_001, 5_125] {
+            assert!(connect_feerate(FeeRate::from_sat_per_kvb(rate)).is_err());
+        }
+        for rate in [1, 5, 1_000] {
+            assert_eq!(
+                connect_feerate(FeeRate::from_sat_per_vb(rate)).unwrap(),
+                rate
+            );
+        }
+    }
 }

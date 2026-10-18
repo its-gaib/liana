@@ -26,7 +26,7 @@ MAX_DERIV = 2**31 - 1
 def test_getinfo(lianad):
     res = lianad.rpc.getinfo()
     assert "timestamp" in res.keys()
-    assert res["version"] == "15.0"
+    assert res["version"] == "15.0.0-sub-sat.1"
     assert res["network"] == "regtest"
     wait_for(lambda: lianad.rpc.getinfo()["block_height"] == 101)
     res = lianad.rpc.getinfo()
@@ -1580,7 +1580,7 @@ def test_rbfpsbt_bump_fee(lianad, bitcoind):
     first_txid = first_psbt.tx.txid().hex()
     # We must provide a valid feerate.
     for bad_feerate in [-1, "foo", 18_446_744_073_709_551_616]:
-        with pytest.raises(RpcError, match=f"Invalid 'feerate' parameter."):
+        with pytest.raises(RpcError, match="Invalid 'feerate'"):
             lianad.rpc.rbfpsbt(first_txid, False, bad_feerate)
     # We cannot RBF yet as first PSBT has not been saved.
     with pytest.raises(RpcError, match=f"Unknown spend transaction '{first_txid}'."):

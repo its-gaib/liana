@@ -114,7 +114,10 @@ pub fn payment_details_view<'a>(
                     .push(
                         legacy::text(format!(
                             "({} sats/vbyte)",
-                            fee_amount.to_sat() / tx.tx.vsize() as u64
+                            liana::feerate::FeeRate::from_fee_vbytes(
+                                fee_amount.to_sat(),
+                                tx.tx.vsize() as u64,
+                            )
                         ))
                         .size(legacy::H4_SIZE)
                         .style(theme::text::secondary),

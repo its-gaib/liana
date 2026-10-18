@@ -1,3 +1,4 @@
+use liana::feerate::FeeRate;
 pub mod client;
 pub mod embedded;
 pub mod model;
@@ -157,14 +158,14 @@ pub trait Daemon: Debug {
         &self,
         coins_outpoints: &[OutPoint],
         destinations: &HashMap<Address<address::NetworkUnchecked>, u64>,
-        feerate_vb: u64,
+        feerate_vb: FeeRate,
         change_address: Option<Address<address::NetworkUnchecked>>,
     ) -> Result<model::CreateSpendResult, DaemonError>;
     async fn rbf_psbt(
         &self,
         txid: &Txid,
         is_cancel: bool,
-        feerate_vb: Option<u64>,
+        feerate_vb: Option<FeeRate>,
     ) -> Result<model::CreateSpendResult, DaemonError>;
     async fn update_spend_tx(&self, psbt: &Psbt) -> Result<(), DaemonError>;
     async fn delete_spend_tx(&self, txid: &Txid) -> Result<(), DaemonError>;
@@ -180,7 +181,7 @@ pub trait Daemon: Debug {
         &self,
         address: Address<address::NetworkUnchecked>,
         coins_outpoints: &[OutPoint],
-        feerate_vb: u64,
+        feerate_vb: FeeRate,
         sequence: Option<u16>,
     ) -> Result<Psbt, DaemonError>;
     async fn list_txs(&self, txid: &[Txid]) -> Result<model::ListTransactionsResult, DaemonError>;

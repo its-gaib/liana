@@ -1,3 +1,4 @@
+use liana::feerate::FeeRate;
 use std::{
     collections::{HashMap, HashSet},
     convert::TryInto,
@@ -147,7 +148,12 @@ impl State for TransactionsPanel {
             },
             Message::RbfModal(tx, is_cancel, res) => match res {
                 Ok(descendant_txids) => {
-                    let modal = CreateRbfModal::new(*tx, is_cancel, descendant_txids);
+                    let modal = CreateRbfModal::new(
+                        *tx,
+                        is_cancel,
+                        descendant_txids,
+                        daemon.backend().is_remote(),
+                    );
                     self.modal = TransactionsModal::CreateRbf(modal);
                 }
                 Err(e) => {
@@ -342,6 +348,20 @@ impl From<TransactionsPanel> for Box<dyn State> {
     }
 }
 
+/// Round the original measured rate upwards before adding the conservative
+/// 1 sat/vbyte relay increment. Integer-only remote APIs need another ceiling.
+fn minimum_replacement_feerate(fee: u64, vsize: u64, is_remote: bool) -> FeeRate {
+    let rate = FeeRate::from_fee_vbytes(fee, vsize)
+        .checked_add(FeeRate::from_sat_per_vb(1))
+        .unwrap_or(FeeRate::from_sat_per_kvb(u64::MAX));
+    if is_remote {
+        let kvb = rate.as_sat_per_kvb();
+        FeeRate::from_sat_per_vb(kvb / 1_000 + u64::from(kvb % 1_000 != 0))
+    } else {
+        rate
+    }
+}
+
 #[derive(Debug)]
 pub struct CreateRbfModal {
     /// Transaction to replace.
@@ -349,14 +369,14 @@ pub struct CreateRbfModal {
     /// Whether to cancel or bump fee.
     is_cancel: bool,
     /// Min feerate required for RBF.
-    min_feerate_vb: u64,
+    min_feerate_vb: FeeRate,
     /// IDs of any transactions from this wallet that are direct descendants of
     /// the transaction to be replaced.
     descendant_txids: HashSet<Txid>,
     /// Feerate form value.
     feerate_val: form::Value<String>,
     /// Parsed feerate.
-    feerate_vb: Option<u64>,
+    feerate_vb: Option<FeeRate>,
     /// Replacement transaction ID.
     replacement_txid: Option<Txid>,
 
@@ -369,26 +389,27 @@ impl CreateRbfModal {
         tx: model::HistoryTransaction,
         is_cancel: bool,
         descendant_txids: HashSet<Txid>,
+        is_remote: bool,
     ) -> Self {
-        let prev_feerate_vb = tx
-            .fee_amount
-            .expect("rbf should only be used on a transaction with fee amount set")
-            .to_sat()
-            .checked_div(tx.tx.vsize().try_into().expect("vsize must fit in u64"))
-            .expect("transaction vsize must be positive");
-        let min_feerate_vb = prev_feerate_vb.checked_add(1).unwrap();
+        let min_feerate_vb = minimum_replacement_feerate(
+            tx.fee_amount
+                .expect("rbf should only be used on a transaction with fee amount set")
+                .to_sat(),
+            tx.tx.vsize().try_into().expect("vsize must fit in u64"),
+            is_remote,
+        );
         Self {
             tx,
             is_cancel,
             min_feerate_vb,
             descendant_txids,
             feerate_val: form::Value {
-                valid: true,
+                valid: min_feerate_vb <= MAX_FEERATE,
                 warning: None,
                 value: min_feerate_vb.to_string(),
             },
             // For cancel, we let `rbfpsbt` set the feerate.
-            feerate_vb: if is_cancel {
+            feerate_vb: if is_cancel || min_feerate_vb > MAX_FEERATE {
                 None
             } else {
                 Some(min_feerate_vb)
@@ -408,7 +429,7 @@ impl CreateRbfModal {
         match message {
             Message::View(view::Message::CreateRbf(view::CreateRbfMessage::FeerateEdited(s))) => {
                 self.warning = None;
-                if let Ok(value) = s.parse::<u64>() {
+                if let Ok(value) = s.parse::<FeeRate>() {
                     self.feerate_val.valid = value >= self.min_feerate_vb && value <= MAX_FEERATE;
                     if self.feerate_val.valid {
                         self.feerate_vb = Some(value);
@@ -431,6 +452,9 @@ impl CreateRbfModal {
                 }
             }
             Message::View(view::Message::CreateRbf(view::CreateRbfMessage::Confirm)) => {
+                if !self.is_cancel && self.feerate_vb.is_none() {
+                    return Task::none();
+                }
                 self.warning = None;
                 self.processing = true;
                 return Task::perform(
@@ -468,7 +492,7 @@ async fn rbf(
     daemon: Arc<dyn Daemon + Sync + Send>,
     previous_tx: model::HistoryTransaction,
     is_cancel: bool,
-    feerate_vb: Option<u64>,
+    feerate_vb: Option<FeeRate>,
 ) -> Result<Txid, Error> {
     let previous_txid = previous_tx.tx.compute_txid();
     let psbt = match daemon
@@ -519,4 +543,30 @@ async fn rbf(
 
     daemon.update_spend_tx(&psbt).await?;
     Ok(psbt.unsigned_tx.compute_txid())
+}
+
+#[cfg(test)]
+mod fractional_feerate_tests {
+    use super::*;
+
+    #[test]
+    fn replacement_minimum_preserves_fractional_original_rate() {
+        assert_eq!(
+            minimum_replacement_feerate(21, 200, false).to_string(),
+            "1.105"
+        );
+        assert_eq!(
+            minimum_replacement_feerate(201, 200, false).to_string(),
+            "2.005"
+        );
+        // Round upwards if the measured rate needs more than three decimals.
+        assert_eq!(
+            minimum_replacement_feerate(1, 300, false).to_string(),
+            "1.004"
+        );
+        assert!(minimum_replacement_feerate(u64::MAX, 1, false) > MAX_FEERATE);
+        // Hosted APIs continue to receive an integer, rounded upwards.
+        assert_eq!(minimum_replacement_feerate(201, 200, true).to_string(), "3");
+        assert_eq!(minimum_replacement_feerate(200, 200, true).to_string(), "2");
+    }
 }

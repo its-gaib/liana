@@ -1,3 +1,4 @@
+use liana::feerate::FeeRate;
 use lianad::bip329::Labels;
 use lianad::commands::UpdateDerivIndexesResult;
 use std::collections::{HashMap, HashSet};
@@ -170,7 +171,7 @@ impl Daemon for EmbeddedDaemon {
         &self,
         coins_outpoints: &[OutPoint],
         destinations: &HashMap<Address<address::NetworkUnchecked>, u64>,
-        feerate_vb: u64,
+        feerate_vb: FeeRate,
         change_address: Option<Address<address::NetworkUnchecked>>,
     ) -> Result<CreateSpendResult, DaemonError> {
         self.command(|daemon| {
@@ -185,7 +186,7 @@ impl Daemon for EmbeddedDaemon {
         &self,
         txid: &Txid,
         is_cancel: bool,
-        feerate_vb: Option<u64>,
+        feerate_vb: Option<FeeRate>,
     ) -> Result<CreateSpendResult, DaemonError> {
         self.command(|daemon| {
             daemon
@@ -234,7 +235,7 @@ impl Daemon for EmbeddedDaemon {
         &self,
         address: Address<address::NetworkUnchecked>,
         coins_outpoints: &[OutPoint],
-        feerate_vb: u64,
+        feerate_vb: FeeRate,
         sequence: Option<u16>,
     ) -> Result<Psbt, DaemonError> {
         self.command(|daemon| {

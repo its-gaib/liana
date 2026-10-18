@@ -3161,7 +3161,7 @@ dependencies = [
 
 [[package]]
 name = "liana"
-version = "15.0.0"
+version = "15.0.0-sub-sat.1"
 dependencies = [
  "bdk_coin_select",
  "bip39",
@@ -3170,6 +3170,7 @@ dependencies = [
  "miniscript",
  "rdrand",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3223,7 +3224,7 @@ dependencies = [
 
 [[package]]
 name = "liana-gui"
-version = "15.0.0"
+version = "15.0.0-sub-sat.1"
 dependencies = [
  "async-fd-lock",
  "async-hwi",
@@ -3278,7 +3279,7 @@ dependencies = [
 
 [[package]]
 name = "lianad"
-version = "15.0.0"
+version = "15.0.0-sub-sat.1"
 dependencies = [
  "backtrace",
  "bdk_electrum",
