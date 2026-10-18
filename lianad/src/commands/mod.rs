@@ -1007,14 +1007,15 @@ impl DaemonControl {
         // rules #3, #4 and #6 (see
         // https://github.com/bitcoin/bitcoin/blob/master/doc/policy/mempool-replacements.md). By
         // default (ie if the transaction we are replacing was dropped from the mempool) there is
-        // no minimum absolute fee and the minimum target is our supported minimum.
+        // no minimum absolute fee. Preserve the conservative 1 sat/vb fallback
+        // for replacements; only initial spends use the lower supported minimum.
         // Keep a conservative 1 sat/vb increment for compatibility with older nodes.
         let (min_feerate_vb, descendant_fees) = self
             .bitcoin
             .mempool_spenders(&prev_outpoints)
             .into_iter()
             .fold(
-                (spend::MIN_FEERATE_VB, bitcoin::Amount::from_sat(0)),
+                (FeeRate::from_sat_per_vb(1), bitcoin::Amount::from_sat(0)),
                 |(min_feerate, descendant_fee), entry| {
                     let entry_feerate =
                         FeeRate::from_fee_vbytes(entry.fees.base.to_sat(), entry.vsize)
@@ -1532,7 +1533,6 @@ pub struct CreateRecoveryResult {
 mod tests {
     use super::*;
     use crate::{bitcoin::Block, database::BlockInfo, testutils::*};
-    use liana::spend::InsaneFeeInfo;
 
     use bitcoin::{
         bip32::{self, ChildNumber},

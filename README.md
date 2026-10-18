@@ -40,6 +40,7 @@ including sends, refreshes, recovery transactions, and fee bumping. Rates suppor
 decimal places. Your connected Bitcoin Core node must accept the selected rate; low fees can delay
 confirmation. A refresh resets the recovery timelock only after confirmation. See
 [transaction fees](doc/USAGE.md#transaction-fees) for node policy and safety details.
+Download this fork’s unsigned builds from the [fractional-fee release](https://github.com/its-gaib/liana/releases/tag/v15.0-sub-sat.1).
 
 Liana is available on Windows, Mac and Linux. To install and start using it see
 [`doc/USAGE.md`](doc/USAGE.md). A more accessible version of Liana is also available as a web

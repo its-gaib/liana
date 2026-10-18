@@ -274,6 +274,8 @@ impl bdk_coin_select::BnbMetric for LowestFeeChangeCondition {
 ///
 /// `must_have_change` indicates whether the transaction must have a change output.
 /// If `true`, the returned change amount will be positive.
+// Keep the integer ceiling calculation compatible with the daemon's Rust 1.63 MSRV.
+#[allow(clippy::manual_div_ceil)]
 fn select_coins_for_spend(
     candidate_coins: &[CandidateCoin],
     base_tx: bitcoin::Transaction,

@@ -377,8 +377,11 @@ will be used as a change address in the replacement and the others will be treat
 
 Fee rates accept the same numeric format as [`createspend`](#createspend). Replacements retain a
 conservative incremental relay allowance of 1 sat/vB for compatibility with older Bitcoin Core
-versions, so a small fractional increase may be insufficient. An explicit rate that is too low is
-rejected. Fee bumping requires signing and broadcasting the replacement transaction.
+versions. The minimum target is computed from the actual transaction fee rate, rounded up to
+0.001 sat/vB, plus that allowance; an integer target can therefore be too low when the previous
+transaction's actual rate is slightly above an integer. If the original transaction is absent
+from the local mempool, a conservative 1 sat/vB minimum is retained. An explicit rate that is too
+low is rejected. Fee bumping requires signing and broadcasting the replacement transaction.
 
 For a cancellation, omit `feerate`: the target fee rate is set to the minimum value
 allowed in order to replace this transaction using RBF (see https://github.com/bitcoin/bitcoin/blob/master/doc/policy/mempool-replacements.md#current-replace-by-fee-policy for further details about this and other conditions that must be satisfied when using RBF).

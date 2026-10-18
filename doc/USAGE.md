@@ -150,15 +150,19 @@ fee on your signing device before approving a transaction.
 
 For a local Bitcoin Core node, the selected rate must meet both the node's relay floor and its
 current mempool minimum. Check `bitcoin-cli getmempoolinfo`: `minrelaytxfee` and `mempoolminfee`
-are in BTC/kvB, where `0.00000100` BTC/kvB equals `0.1` sat/vB. Older Core versions may require
-explicit policy configuration to accept rates below 1 sat/vB. Liana does not change your node's
-policy. Local acceptance does not guarantee that other nodes or miners will accept the transaction.
+are in BTC/kvB, where `0.00000100` BTC/kvB equals `0.1` sat/vB.
+[Bitcoin Core 30.0](https://bitcoincore.org/en/releases/30.0/#policy) lowered the default relay floor
+to 0.1 sat/vB; older versions may require explicit policy configuration. Liana does not change
+your node's policy. Local acceptance does not guarantee that other nodes or miners will accept the transaction.
 
 Low fees can cause long confirmation delays or mempool eviction. Eviction does not cancel a signed
 transaction: it may be rebroadcast while its inputs remain unspent. Keep the required signing devices
 or cosigners available if you might need to bump the fee. Replacements use a conservative 1 sat/vB
 incremental relay allowance, so the smallest accepted bump can be substantially above the original
-fractional rate. Dust limits still apply independently of the selected fee rate.
+fractional rate. If the original transaction is absent from the local mempool, automatic
+cancellation retains a conservative 1 sat/vB minimum. Local acceptance of a cancellation does not
+guarantee replacement on other nodes; confirmation is required. Dust limits still apply
+independently of the selected fee rate.
 
 #### On refreshing coins
 

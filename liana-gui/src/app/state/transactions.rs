@@ -348,18 +348,20 @@ impl From<TransactionsPanel> for Box<dyn State> {
     }
 }
 
-/// Round the original measured rate upwards before adding the conservative
-/// 1 sat/vbyte relay increment. Integer-only remote APIs need another ceiling.
+/// Local transactions preserve the measured rate to 0.001 sat/vbyte before
+/// adding the conservative 1 sat/vbyte relay increment. Connect retains its
+/// existing integer-only replacement heuristic to avoid increasing hosted fees.
 fn minimum_replacement_feerate(fee: u64, vsize: u64, is_remote: bool) -> FeeRate {
-    let rate = FeeRate::from_fee_vbytes(fee, vsize)
-        .checked_add(FeeRate::from_sat_per_vb(1))
-        .unwrap_or(FeeRate::from_sat_per_kvb(u64::MAX));
     if is_remote {
-        let kvb = rate.as_sat_per_kvb();
-        FeeRate::from_sat_per_vb(kvb / 1_000 + u64::from(kvb % 1_000 != 0))
-    } else {
-        rate
+        return fee
+            .checked_div(vsize)
+            .and_then(|rate| rate.checked_add(1))
+            .map(FeeRate::from_sat_per_vb)
+            .unwrap_or(FeeRate::from_sat_per_kvb(u64::MAX));
     }
+    FeeRate::from_fee_vbytes(fee, vsize)
+        .checked_add(FeeRate::from_sat_per_vb(1))
+        .unwrap_or(FeeRate::from_sat_per_kvb(u64::MAX))
 }
 
 #[derive(Debug)]
@@ -565,8 +567,11 @@ mod fractional_feerate_tests {
             "1.004"
         );
         assert!(minimum_replacement_feerate(u64::MAX, 1, false) > MAX_FEERATE);
-        // Hosted APIs continue to receive an integer, rounded upwards.
-        assert_eq!(minimum_replacement_feerate(201, 200, true).to_string(), "3");
+        assert!(minimum_replacement_feerate(u64::MAX, 1, true) > MAX_FEERATE);
+        assert!(minimum_replacement_feerate(1, 0, false) > MAX_FEERATE);
+        assert!(minimum_replacement_feerate(1, 0, true) > MAX_FEERATE);
+        // Hosted APIs preserve the existing floor(original rate) + 1 heuristic.
+        assert_eq!(minimum_replacement_feerate(201, 200, true).to_string(), "2");
         assert_eq!(minimum_replacement_feerate(200, 200, true).to_string(), "2");
     }
 }

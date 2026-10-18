@@ -16,12 +16,13 @@ from test_framework.utils import (
 
 
 @pytest.fixture
-def bitcoind(directory):
+def bitcoind(directory, request):
     # These policy settings apply only to this test's disposable regtest node.
     node = Bitcoind(bitcoin_dir=os.path.join(directory, "bitcoind"))
+    min_relay = Decimal(str(getattr(request, "param", 0.1))) * 1000 / COIN
     node.cmd_line.extend(
         [
-            "-minrelaytxfee=0.00000100",
+            f"-minrelaytxfee={min_relay:.8f}",
             "-blockmintxfee=0.00000100",
             "-incrementalrelayfee=0.00001000",
         ]
@@ -87,7 +88,10 @@ def test_fractional_fee_roundtrip(lianad, bitcoind, feerate, mode):
             if mode == "sweep"
             else lianad.rpc.createspend(destinations, outpoints, feerate)
         )
-    assert result["warnings"] == []
+    if mode == "recovery":
+        assert set(result) == {"psbt"}
+    else:
+        assert result["warnings"] == []
     psbt = PSBT.from_base64(result["psbt"])
     outputs = outputs_by_address(bitcoind, psbt)
     wallet_change = {item["change"] for item in lianad.rpc.listaddresses()["addresses"]}
@@ -107,8 +111,8 @@ def test_fractional_fee_roundtrip(lianad, bitcoind, feerate, mode):
     )
     txid = sign_and_broadcast(lianad, bitcoind, psbt, recovery=mode == "recovery")
     fee = assert_mempool_fee(bitcoind, txid, coin["amount"], psbt, feerate)
-    if feerate < 1:
-        assert fee <= bitcoind.rpc.getmempoolentry(txid)["vsize"]
+    if feerate <= 0.333:
+        assert fee < bitcoind.rpc.getmempoolentry(txid)["vsize"]
     if mode in ("sweep", "recovery"):
         assert outputs[recipient] == coin["amount"] - fee
     bitcoind.generate_block(1, wait_for_mempool=txid)
@@ -226,3 +230,75 @@ def test_fractional_fee_invalid_rpc(lianad, bitcoind):
             lianad.rpc.createrecovery(recipient, invalid, 10, [coin["outpoint"]])
         with pytest.raises(RpcError, match="feerate"):
             lianad.rpc.rbfpsbt(txid, False, invalid)
+
+
+@pytest.mark.parametrize("bitcoind", [1], indirect=True)
+def test_fractional_fee_node_policy_rejection(lianad, bitcoind):
+    """A node's higher relay floor rejects a spend without consuming its inputs."""
+    coin = fund_wallet(lianad, bitcoind)
+    recipient = bitcoind.rpc.getnewaddress()
+    rejected = PSBT.from_base64(
+        lianad.rpc.createspend({recipient: 40_000}, [coin["outpoint"]], 0.1)["psbt"]
+    )
+    rejected_txid = rejected.tx.txid().hex()
+    with pytest.raises(RpcError, match="min relay fee"):
+        sign_and_broadcast_psbt(lianad, rejected)
+    assert rejected_txid not in bitcoind.rpc.getrawmempool()
+    assert bitcoind.rpc.getreceivedbyaddress(recipient, 0) == 0
+    remaining = lianad.rpc.listcoins(["confirmed"])["coins"]
+    assert len(remaining) == 1
+    assert remaining[0]["outpoint"] == coin["outpoint"]
+    assert remaining[0]["amount"] == coin["amount"]
+    assert remaining[0]["spend_info"] is None
+
+    accepted = PSBT.from_base64(
+        lianad.rpc.createspend({recipient: 40_000}, [coin["outpoint"]], 1)["psbt"]
+    )
+    outputs = outputs_by_address(bitcoind, accepted)
+    assert outputs[recipient] == 40_000
+    assert len(outputs) == 2
+    assert set(outputs) - {recipient} <= {
+        item["change"] for item in lianad.rpc.listaddresses()["addresses"]
+    }
+    accepted_txid = sign_and_broadcast_psbt(lianad, accepted)
+    fee = assert_mempool_fee(bitcoind, accepted_txid, coin["amount"], accepted, 1)
+    bitcoind.generate_block(1, wait_for_mempool=accepted_txid)
+    wait_for(lambda: spend_is_confirmed(lianad, coin["outpoint"]))
+    assert int(bitcoind.rpc.getreceivedbyaddress(recipient, 1) * COIN) == 40_000
+    wait_for(lambda: len(lianad.rpc.listcoins(["confirmed"])["coins"]) == 1)
+    change = lianad.rpc.listcoins(["confirmed"])["coins"][0]
+    assert change["is_change"]
+    assert change["amount"] == coin["amount"] - 40_000 - fee
+
+
+@pytest.mark.parametrize("bitcoind", [1], indirect=True)
+def test_fractional_fee_unbroadcast_cancel_fallback(lianad, bitcoind):
+    """An absent original keeps the conservative 1 sat/vB cancellation floor."""
+    coin = fund_wallet(lianad, bitcoind)
+    recipient = bitcoind.rpc.getnewaddress()
+    first = PSBT.from_base64(
+        lianad.rpc.createspend({recipient: 40_000}, [coin["outpoint"]], 0.1)["psbt"]
+    )
+    first = lianad.signer.sign_psbt(first)
+    lianad.rpc.updatespend(first.to_base64())
+    first_txid = first.tx.txid().hex()
+    assert first_txid not in bitcoind.rpc.getrawmempool()
+    with pytest.raises(RpcError, match="too low"):
+        lianad.rpc.rbfpsbt(first_txid, False, 0.5)
+    cancel = PSBT.from_base64(lianad.rpc.rbfpsbt(first_txid, True)["psbt"])
+    outputs = outputs_by_address(bitcoind, cancel)
+    assert len(outputs) == 1
+    assert recipient not in outputs
+    assert set(outputs) <= {
+        item["change"] for item in lianad.rpc.listaddresses()["addresses"]
+    }
+    cancel_txid = sign_and_broadcast_psbt(lianad, cancel)
+    fee = assert_mempool_fee(bitcoind, cancel_txid, coin["amount"], cancel, 1)
+    bitcoind.generate_block(1, wait_for_mempool=cancel_txid)
+    wait_for(lambda: spend_is_confirmed(lianad, coin["outpoint"]))
+    assert bitcoind.rpc.getreceivedbyaddress(recipient, 0) == 0
+    wait_for(lambda: len(lianad.rpc.listcoins(["confirmed"])["coins"]) == 1)
+    assert (
+        lianad.rpc.listcoins(["confirmed"])["coins"][0]["amount"]
+        == coin["amount"] - fee
+    )

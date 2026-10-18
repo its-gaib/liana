@@ -1,3 +1,6 @@
+from decimal import Decimal
+import math
+
 import pytest
 import random
 import re
@@ -21,6 +24,14 @@ from test_framework.utils import (
 )
 
 MAX_DERIV = 2**31 - 1
+
+
+def minimum_rbf_feerate(bitcoind, txid):
+    """Round the actual fee rate up to 0.001 sat/vB, then add 1 sat/vB."""
+    entry = bitcoind.rpc.getmempoolentry(txid)
+    fee_sats = int(entry["fees"]["base"] * COIN)
+    sat_per_kvb = (fee_sats * 1000 + entry["vsize"] - 1) // entry["vsize"]
+    return Decimal(sat_per_kvb) / 1000 + 1
 
 
 def test_getinfo(lianad):
@@ -1608,15 +1619,19 @@ def test_rbfpsbt_bump_fee(lianad, bitcoind):
         and first_txid in lc_res[0]["outpoint"]
         and lc_res[0]["is_from_self"] is True
     )
-    # We can now use RBF, but the feerate must be higher than that of the first transaction.
-    with pytest.raises(RpcError, match=f"Feerate 1 too low for minimum feerate 2."):
+    # Include the fractional part of the actual rate when checking the RBF minimum.
+    first_minimum = minimum_rbf_feerate(bitcoind, first_txid)
+    with pytest.raises(
+        RpcError,
+        match=re.escape(f"Feerate 1 too low for minimum feerate {first_minimum:f}."),
+    ):
         lianad.rpc.rbfpsbt(first_txid, False, 1)
-    # Using a higher feerate works.
-    lianad.rpc.rbfpsbt(first_txid, False, 2)
+    # Using the exact minimum rate works.
+    lianad.rpc.rbfpsbt(first_txid, False, float(first_minimum))
 
     # We can still use RBF if the PSBT is no longer in the DB.
     lianad.rpc.delspendtx(first_txid)
-    lianad.rpc.rbfpsbt(first_txid, False, 2)
+    lianad.rpc.rbfpsbt(first_txid, False, float(first_minimum))
 
     # Let's use an even higher feerate.
     rbf_1_res = lianad.rpc.rbfpsbt(first_txid, False, 10)
@@ -1666,13 +1681,16 @@ def test_rbfpsbt_bump_fee(lianad, bitcoind):
     # If we resave the PSBT, then we can use RBF and it will use the first RBF's
     # feerate to set the min feerate, instead of 1 sat/vb of the first transaction:
     lianad.rpc.updatespend(first_psbt.to_base64())
+    replacement_minimum = minimum_rbf_feerate(bitcoind, rbf_1_txid)
     with pytest.raises(
         RpcError,
-        match=f"Feerate {int(rbf_1_feerate)} too low for minimum feerate {int(rbf_1_feerate) + 1}.",
+        match=re.escape(
+            f"Feerate {int(rbf_1_feerate)} too low for minimum feerate {replacement_minimum:f}."
+        ),
     ):
         lianad.rpc.rbfpsbt(first_txid, False, int(rbf_1_feerate))
-    # Using 1 more for feerate works.
-    feerate = int(rbf_1_feerate) + 1
+    # Choose an integer target at least as high as the exact minimum.
+    feerate = math.ceil(replacement_minimum)
     lianad.rpc.rbfpsbt(first_txid, False, feerate)
     # Add a new transaction spending the change from the first RBF.
     desc_1_destinations = {
@@ -1788,7 +1806,7 @@ def test_rbfpsbt_insufficient_funds(lianad, bitcoind):
     spend_txid_1 = sign_and_broadcast_psbt(lianad, spend_psbt_1)
 
     # We don't have sufficient funds to bump the fee.
-    feerate = 3 if USE_TAPROOT else 2
+    feerate = math.ceil(minimum_rbf_feerate(bitcoind, spend_txid_1))
     assert "missing" in lianad.rpc.rbfpsbt(spend_txid_1, False, feerate)
     # We can still cancel it as the coin has enough value to create a single
     # output at a higher feerate.

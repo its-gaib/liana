@@ -31,12 +31,16 @@ impl FeeRate {
     }
 
     /// Minimum whole-satoshi fee, rounded up. Overflow never wraps or saturates.
+    // Integer div_ceil requires Rust 1.73; the daemon supports Rust 1.63.
+    #[allow(clippy::manual_div_ceil)]
     pub fn fee_vbytes(self, vsize: u64) -> Option<u64> {
         u64::try_from((u128::from(self.0) * u128::from(vsize) + 999) / 1_000).ok()
     }
 
     /// Measured rate rounded up to the next 0.001 sat/vB. A zero size is invalid.
     /// The result may exceed the supported range; callers must validate user-selected rates.
+    // Integer div_ceil requires Rust 1.73; the daemon supports Rust 1.63.
+    #[allow(clippy::manual_div_ceil)]
     pub fn from_fee_vbytes(fee: u64, vsize: u64) -> Self {
         if vsize == 0 {
             return Self(u64::MAX);
